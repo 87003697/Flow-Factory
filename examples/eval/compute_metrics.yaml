@@ -1,0 +1,54 @@
+# Flow-Factory Evaluation Configuration
+# Compute metrics on generated images
+#
+# Usage: ff-eval examples/eval/compute_metrics.yaml
+#        ff-eval examples/eval/compute_metrics.yaml --samples_dir my_outputs/
+#        ff-eval --list_metrics  # Show available metrics
+
+# Input Configuration
+samples_dir: "outputs/flux1_lora"       # Directory containing generated images
+samples_pattern: "*.png"                 # Glob pattern for images
+
+# Reference Data (for metrics that need it)
+# reference_dir: "dataset/real_images"  # For FID computation (no local reference)
+prompts_file: "dataset/t2is/test.jsonl" # For CLIP Score / PickScore
+
+# Metrics to Compute
+# Each metric can have its own configuration
+metrics:
+  # FID: Fréchet Inception Distance (lower is better)
+  # Requires reference_dir (disabled – no local reference images)
+  # fid:
+  #   batch_size: 32
+  
+  # Inception Score (higher is better)
+  # No reference needed
+  inception_score:
+    batch_size: 32
+    splits: 10  # For std estimation
+  
+  # CLIP Score: Text-image alignment (higher is better)
+  # Requires prompts_file
+  clip_score:
+    model: "openai/clip-vit-large-patch14"
+    batch_size: 32
+  
+  # PickScore: Preference alignment (higher is better)
+  # Requires prompts_file
+  pickscore:
+    model_name_or_path: "yuvalkirstain/PickScore_v1"
+    batch_size: 32
+  
+  # LPIPS: Perceptual similarity (lower is better)
+  # Requires reference_dir for pairwise comparison
+  # lpips:
+  #   net: "alex"  # alex, vgg, squeeze
+  #   batch_size: 16
+
+# Output Configuration
+output:
+  output_path: "results/metrics.json"
+
+# Device Settings
+device: "cuda"
+batch_size: 32

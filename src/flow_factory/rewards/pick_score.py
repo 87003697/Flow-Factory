@@ -32,6 +32,16 @@ class PickScoreRewardModel(PointwiseRewardModel):
         self.processor = CLIPProcessor.from_pretrained(processor_path)
         self.model = CLIPModel.from_pretrained(model_path).eval().to(self.device)
 
+    def _extract_embeds(self, output):
+        """Extract tensor from model output (handles both tensor and BaseModelOutput)."""
+        if isinstance(output, torch.Tensor):
+            return output
+        if hasattr(output, 'image_embeds'):
+            return output.image_embeds
+        if hasattr(output, 'text_embeds'):
+            return output.text_embeds
+        return output.pooler_output
+
     def _compute_scores_batch(
         self,
         prompt: list[str],
@@ -56,10 +66,10 @@ class PickScoreRewardModel(PointwiseRewardModel):
         )
         text_inputs = {k: v.to(device=self.device) for k, v in text_inputs.items()}
         
-        image_embs = self.model.get_image_features(**image_inputs)
+        image_embs = self._extract_embeds(self.model.get_image_features(**image_inputs))
         image_embs = image_embs / image_embs.norm(p=2, dim=-1, keepdim=True)
         
-        text_embs = self.model.get_text_features(**text_inputs)
+        text_embs = self._extract_embeds(self.model.get_text_features(**text_inputs))
         text_embs = text_embs / text_embs.norm(p=2, dim=-1, keepdim=True)
         
         logit_scale = self.model.logit_scale.exp()
@@ -135,6 +145,16 @@ class PickScoreRankRewardModel(GroupwiseRewardModel):
         self.processor = CLIPProcessor.from_pretrained(processor_path)
         self.model = CLIPModel.from_pretrained(model_path).eval().to(self.device)
 
+    def _extract_embeds(self, output):
+        """Extract tensor from model output (handles both tensor and BaseModelOutput)."""
+        if isinstance(output, torch.Tensor):
+            return output
+        if hasattr(output, 'image_embeds'):
+            return output.image_embeds
+        if hasattr(output, 'text_embeds'):
+            return output.text_embeds
+        return output.pooler_output
+
     def _compute_scores_batch(
         self,
         prompt: list[str],
@@ -159,10 +179,10 @@ class PickScoreRankRewardModel(GroupwiseRewardModel):
         )
         text_inputs = {k: v.to(device=self.device) for k, v in text_inputs.items()}
         
-        image_embs = self.model.get_image_features(**image_inputs)
+        image_embs = self._extract_embeds(self.model.get_image_features(**image_inputs))
         image_embs = image_embs / image_embs.norm(p=2, dim=-1, keepdim=True)
         
-        text_embs = self.model.get_text_features(**text_inputs)
+        text_embs = self._extract_embeds(self.model.get_text_features(**text_inputs))
         text_embs = text_embs / text_embs.norm(p=2, dim=-1, keepdim=True)
         
         logit_scale = self.model.logit_scale.exp()

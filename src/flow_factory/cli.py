@@ -207,5 +207,63 @@ def train_cli():
     subprocess.run(cmd, check=True)
 
 
+def inference_cli():
+    """CLI entry point for inference."""
+    parser = argparse.ArgumentParser(description="Flow-Factory Inference")
+    parser.add_argument("config", type=str, help="Path to YAML config")
+    parser.add_argument("--prompts", nargs="+", help="Override prompts from command line")
+    parser.add_argument("--output_dir", type=str, help="Override output directory")
+    parser.add_argument("--checkpoint_path", type=str, help="Override checkpoint path")
+    args, unknown = parser.parse_known_args()
+    
+    # Run inference module directly (single process, no accelerate needed)
+    cmd = [sys.executable, "-m", "flow_factory.inference", args.config]
+    
+    if args.prompts:
+        cmd.extend(["--prompts"] + args.prompts)
+    if args.output_dir:
+        cmd.extend(["--output_dir", args.output_dir])
+    if args.checkpoint_path:
+        cmd.extend(["--checkpoint_path", args.checkpoint_path])
+    
+    cmd.extend(unknown)
+    
+    logger.info("=" * 60)
+    logger.info("Flow-Factory Inference")
+    logger.info(f"Config: {args.config}")
+    logger.info("=" * 60)
+    
+    subprocess.run(cmd, check=True)
+
+
+def eval_cli():
+    """CLI entry point for evaluation."""
+    parser = argparse.ArgumentParser(description="Flow-Factory Evaluation")
+    parser.add_argument("config", type=str, help="Path to YAML config")
+    parser.add_argument("--samples_dir", type=str, help="Override samples directory")
+    parser.add_argument("--output_path", type=str, help="Override output path")
+    parser.add_argument("--list_metrics", action="store_true", help="List available metrics")
+    args, unknown = parser.parse_known_args()
+    
+    # Run evaluate module directly
+    cmd = [sys.executable, "-m", "flow_factory.evaluate", args.config]
+    
+    if args.samples_dir:
+        cmd.extend(["--samples_dir", args.samples_dir])
+    if args.output_path:
+        cmd.extend(["--output_path", args.output_path])
+    if args.list_metrics:
+        cmd.append("--list_metrics")
+    
+    cmd.extend(unknown)
+    
+    logger.info("=" * 60)
+    logger.info("Flow-Factory Evaluation")
+    logger.info(f"Config: {args.config}")
+    logger.info("=" * 60)
+    
+    subprocess.run(cmd, check=True)
+
+
 if __name__ == "__main__":
     train_cli()

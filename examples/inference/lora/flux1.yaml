@@ -1,0 +1,37 @@
+# Flow-Factory Inference Configuration
+# Generate images using a trained checkpoint
+#
+# Usage: ff-inference examples/inference/lora/flux1.yaml
+#        ff-inference examples/inference/lora/flux1.yaml --prompts "A photo of a cat"
+
+# Model Configuration
+model:
+  model_name_or_path: "black-forest-labs/FLUX.1-dev"
+  model_type: "flux1"
+  finetune_type: "lora"
+  checkpoint_path: "saves/flux1_lora_grpo_20260331_122629/checkpoints/checkpoint-1980"
+
+# Data Configuration
+data:
+  # Option 1: Prompts file (supports .txt, .json, .jsonl)
+  prompts_file: "dataset/t2is/test.jsonl"
+  
+  # Option 2: Inline prompts (overridden by CLI --prompts)
+  # prompts:
+  #   - "A photo of a cat sitting on a windowsill"
+  #   - "A sunset over the ocean"
+
+# Inference Settings
+inference:
+  num_inference_steps: 28
+  guidance_scale: 3.5
+  height: 1024
+  width: 1024
+  num_samples_per_prompt: 1
+  seed: 42
+
+# Output Configuration
+output:
+  output_dir: "outputs/flux1_lora"
+  save_format: "png"  # png, jpg, webp
+  save_metadata: true  # Save generation parameters as JSON

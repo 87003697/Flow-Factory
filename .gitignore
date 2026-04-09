@@ -52,6 +52,7 @@ wandb/
 runs/
 tensorboard/
 saves/
+_reference_codes/
 
 # ====================
 # Log files
