@@ -18,7 +18,7 @@ from typing import Any, Dict, Optional
 import wandb
 
 from .abc import Logger
-from .formatting import LogImage, LogTable, LogVideo
+from .formatting import LogImage, LogVideo
 
 
 class WandbLogger(Logger):
@@ -31,7 +31,10 @@ class WandbLogger(Logger):
         self.platform = wandb
 
     def _convert_to_platform(
-        self, value: Any, height: Optional[int] = None, width: Optional[int] = None
+        self,
+        value: Any,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
     ) -> Any:
         if isinstance(value, LogImage):
             return wandb.Image(value.get_value(height, width), caption=value.caption)
@@ -42,17 +45,6 @@ class WandbLogger(Logger):
                 caption=value.caption,
                 format="mp4",
             )
-
-        if isinstance(value, LogTable):
-            h = height or value.target_height
-            data = [
-                [
-                    self._convert_to_platform(item, height=h) if item is not None else None
-                    for item in row
-                ]
-                for row in value.rows
-            ]
-            return wandb.Table(columns=value.columns, data=data)
 
         return value
 
