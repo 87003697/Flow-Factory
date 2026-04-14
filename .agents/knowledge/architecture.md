@@ -124,6 +124,10 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `clip` | `CLIPRewardModel` | Pointwise |
 | `ocr` | `OCRRewardModel` | Pointwise |
 | `vllm_evaluate` | `VLMEvaluateRewardModel` | Pointwise |
+| `unified_reward_image` | `UnifiedRewardImageGenRewardModel` | Pointwise (scalar) |
+| `unified_reward_video` | `UnifiedRewardVideoGenRewardModel` | Pointwise (scalar) |
+| `unified_reward_image_acs` | `UnifiedRewardImageGenACSRewardModel` | Pointwise (structured ACS) |
+| `unified_reward_video_aps` | `UnifiedRewardVideoGenAPSRewardModel` | Pointwise (structured APS) |
 
 ---
 

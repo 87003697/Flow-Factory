@@ -7,6 +7,7 @@ Flow-Factory provides a flexible reward model system that supports both built-in
 - [Reward Model Types](#reward-model-types)
 - [Built-in Reward Models](#built-in-reward-models)
 - [Using Built-in Reward Models](#using-built-in-reward-models)
+- [UnifiedReward Notes](#unifiedreward-notes)
 - [Creating Custom Reward Models](#creating-custom-reward-models)
   - [Pointwise Reward Model](#pointwise-reward-model)
   - [Groupwise Reward Model](#groupwise-reward-model)
@@ -35,6 +36,12 @@ Flow-Factory supports two paradigms for computing rewards:
 |------|------|-------------|-----------|
 | `PickScore` | Pointwise | CLIP-based aesthetic scoring | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
 | `CLIP` | Pointwise | Image-text cosine similarity | [CLIP](https://huggingface.co/openai/clip-vit-large-patch14) |
+| `OCR` | Pointwise | OCR-based text recognition reward | N/A |
+| `vllm_evaluate` | Pointwise | OpenAI-compatible VLM Yes/No evaluation via logprobs | N/A |
+| `unified_reward_image_acs` | Pointwise | UnifiedReward 2.0 image generation structured scoring (Alignment/Coherence/Style) | [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward) |
+| `unified_reward_video_aps` | Pointwise | UnifiedReward 2.0 video generation structured scoring (Alignment/Physics/Style) | [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward) |
+| `unified_reward_image` | Pointwise | **(deprecated)** UnifiedReward scalar score — use `unified_reward_image_acs` instead | [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward) |
+| `unified_reward_video` | Pointwise | **(deprecated)** UnifiedReward scalar score — use `unified_reward_video_aps` instead | [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward) |
 | `PickScore_Rank` | Groupwise | Ranking-based reward using PickScore | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
 
 ## Using Built-in Reward Models
@@ -57,6 +64,95 @@ rewards:
   name: "aesthetic"
   reward_model: "PickScore"
   batch_size: 16
+```
+
+## UnifiedReward Notes
+
+Flow-Factory currently integrates UnifiedReward as an **API-based pointwise reward**, not as a full reproduction of every mode in the upstream repository.
+
+### Current Scope
+
+Two pointwise families are implemented, both using the OpenAI-compatible API transport layer (`UnifiedRewardAPIBase`):
+
+**Structured pointwise family (recommended)** — aligned with UnifiedReward 2.0 API prompts, extracts multiple axis scores and aggregates via configurable weights:
+- `unified_reward_image_acs`: image generation, Alignment/Coherence/Style (each 1-5)
+- `unified_reward_video_aps`: video generation, Alignment/Physics/Style (each 1-5)
+
+Structured models return the aggregated reward in `RewardModelOutput.rewards` and per-axis normalized scores in `RewardModelOutput.extra_info` (e.g. `alignment_scores`, `coherence_scores`, `style_scores`).
+
+**Scalar pointwise family (deprecated)** — extracts a single `Final Score:` value. These have no matching upstream UnifiedReward 2.0 API prompt and are kept only for backward compatibility:
+- `unified_reward_image`: image generation, score range 1-5, normalized to [0, 1]
+- `unified_reward_video`: video generation, score range 1-10, normalized to [0, 1]
+
+### Explicitly Out of Scope Today
+
+- Pairwise or ranking-based UnifiedReward modes
+- Any integration that requires `GroupwiseRewardModel`
+- UnifiedReward 2.0 pair-score outputs
+- Image/video understanding modes that require extra fields such as `question` and `response`
+
+### Why the Upstream Modes Differ
+
+The upstream UnifiedReward repository mixes several independent axes:
+
+- **Task goal**: generation quality vs understanding quality
+- **Media type**: image vs video
+- **Sample organization**: pointwise vs pairwise
+- **Output schema**: scalar `Final Score`, structured multi-axis scores, or pairwise comparisons
+- **Execution backend**: local `transformers`, SGLang API, or vLLM-compatible API
+
+These axes should be treated separately when deciding what belongs in Flow-Factory.
+
+### Class Hierarchy
+
+```
+PointwiseRewardModel
+  └─ UnifiedRewardAPIBase          (API transport: client, retries, text cache)
+       ├─ UnifiedRewardScalarPointwiseBase      (deprecated, scalar: _extract_score → _normalize_score)
+       │    ├─ UnifiedRewardImageGenRewardModel  (unified_reward_image, deprecated)
+       │    └─ UnifiedRewardVideoGenRewardModel  (unified_reward_video, deprecated)
+       └─ UnifiedRewardStructuredPointwiseBase   (recommended, multi-axis: extract → normalize → aggregate)
+            ├─ UnifiedRewardImageGenACSRewardModel (unified_reward_image_acs)
+            └─ UnifiedRewardVideoGenAPSRewardModel (unified_reward_video_aps)
+```
+
+### Example Configs
+
+**Structured ACS (image, recommended) with custom axis weights**:
+```yaml
+rewards:
+  - name: "unified_image_acs"
+    reward_model: "unified_reward_image_acs"
+    batch_size: 8
+    api_base_url: "http://localhost:8080/v1"
+    vlm_model: "UnifiedReward"
+    alignment_weight: 2.0
+    coherence_weight: 1.0
+    style_weight: 0.5
+```
+
+**Structured APS (video, recommended)**:
+```yaml
+rewards:
+  - name: "unified_video_aps"
+    reward_model: "unified_reward_video_aps"
+    batch_size: 4
+    api_base_url: "http://localhost:8080/v1"
+    vlm_model: "UnifiedReward"
+    alignment_weight: 1.0
+    physics_weight: 1.0
+    style_weight: 1.0
+```
+
+**Scalar (image, deprecated)**:
+```yaml
+rewards:
+  - name: "unified_image_score"
+    reward_model: "unified_reward_image"
+    batch_size: 8
+    api_base_url: "http://localhost:8080/v1"
+    api_key: "EMPTY"
+    vlm_model: "UnifiedReward"
 ```
 
 ## Creating Custom Reward Models
