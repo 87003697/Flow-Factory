@@ -54,6 +54,7 @@ def _create_or_load_dataset(
     base_kwargs: dict,
     enable_distributed: bool,
     preprocess_parallelism: Literal["global", "local"] = "global",
+    dataset_cls: type = GeneralDataset,
 ) -> GeneralDataset:
     """
     Create or load preprocessed dataset with optional distributed sharding.
@@ -77,7 +78,7 @@ def _create_or_load_dataset(
                                 'local' for per-node parallelism (no shared FS required)
         
     Returns:
-        GeneralDataset instance (fully preprocessed and ready for training)
+        dataset_cls instance (fully preprocessed and ready for training)
     """
     # Setup shard parameters based on parallelism mode
     kwargs = base_kwargs.copy()
@@ -96,7 +97,7 @@ def _create_or_load_dataset(
         kwargs['shard_index'] = None
     
     # Compute cache path WITHOUT creating dataset (avoids unnecessary preprocessing)
-    merged_cache_path = GeneralDataset.compute_cache_path(
+    merged_cache_path = dataset_cls.compute_cache_path(
         dataset_dir=kwargs['dataset_dir'],
         split=split,
         cache_dir=kwargs.get('cache_dir', '~/.cache/flow_factory/datasets'),
@@ -110,16 +111,16 @@ def _create_or_load_dataset(
     if os.path.exists(merged_cache_path) and not base_kwargs.get('force_reprocess', False):
         if accelerator.is_local_main_process:
             logger.info(f"Loading {split} dataset from merged cache: {merged_cache_path}")
-        return GeneralDataset.load_merged(merged_cache_path)
+        return dataset_cls.load_merged(merged_cache_path)
     
     # Single-process path: direct preprocessing
     if not enable_distributed:
         logger.info(f"Preprocessing {split} dataset (single process)")
-        return GeneralDataset(split=split, **kwargs)
+        return dataset_cls(split=split, **kwargs)
     
     # Distributed path: shard → merge → load
     logger.info(f"Preprocessing {split} dataset shard {kwargs['shard_index']}/{kwargs['num_shards']}")
-    dataset = GeneralDataset(split=split, **kwargs)
+    dataset = dataset_cls(split=split, **kwargs)
     
     # Step 1: Save shard to disk
     shard_path = os.path.join(
@@ -185,7 +186,7 @@ def _create_or_load_dataset(
     accelerator.wait_for_everyone()
 
     # Final step: All processes load merged dataset
-    return GeneralDataset.load_merged(merged_cache_path)
+    return dataset_cls.load_merged(merged_cache_path)
 
 
 def get_dataloader(
@@ -217,6 +218,13 @@ def get_dataloader(
     training_args = config.training_args
     eval_args = config.eval_args
 
+    # Resolve dataset class from config
+    if data_args.dataset_type == 'image_3d':
+        from .image_3D_dataset import Image3DDataset
+        dataset_cls = Image3DDataset
+    else:
+        dataset_cls = GeneralDataset
+
     # Determine if distributed preprocessing is needed
     enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
     preprocess_parallelism = getattr(data_args, 'preprocess_parallelism', 'local')
@@ -227,7 +235,7 @@ def get_dataloader(
         "preprocess_kwargs": filter_kwargs(preprocess_func, **data_args) if preprocess_func else None, # Preprocess kwargs
         'extra_hash_strs': [config.model_args.model_type, config.model_args.model_name_or_path], # Use model info to differentiate caches
     }
-    base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
+    base_kwargs.update(filter_kwargs(dataset_cls.__init__, **data_args))
     base_kwargs['force_reprocess'] = data_args.force_reprocess
 
     # === CREATE/LOAD TRAIN DATASET ===
@@ -245,6 +253,7 @@ def get_dataloader(
         base_kwargs={**base_kwargs, 'preprocess_kwargs': train_preprocess_kwargs},
         enable_distributed=enable_distributed,
         preprocess_parallelism=preprocess_parallelism,
+        dataset_cls=dataset_cls,
     )
 
     # === CREATE TRAIN DATALOADER ===
@@ -259,12 +268,12 @@ def get_dataloader(
         batch_sampler=sampler,
         num_workers=data_args.dataloader_num_workers,
         pin_memory=True,
-        collate_fn=GeneralDataset.collate_fn,
+        collate_fn=dataset_cls.collate_fn,
     )
 
     # === CREATE/LOAD TEST DATASET ===
     test_dataloader = None
-    if GeneralDataset.check_exists(data_args.dataset, "test"):
+    if dataset_cls.check_exists(data_args.dataset, "test"):
         test_preprocess_kwargs = base_kwargs.get('preprocess_kwargs', {}).copy()
         test_preprocess_kwargs.update(
             {
@@ -279,6 +288,7 @@ def get_dataloader(
             base_kwargs={**base_kwargs, 'preprocess_kwargs': test_preprocess_kwargs},
             enable_distributed=enable_distributed,
             preprocess_parallelism=preprocess_parallelism,
+            dataset_cls=dataset_cls,
         )
         
         test_dataloader = DataLoader(
@@ -286,7 +296,7 @@ def get_dataloader(
             batch_size=eval_args.per_device_batch_size,
             shuffle=False,
             num_workers=data_args.dataloader_num_workers,
-            collate_fn=GeneralDataset.collate_fn,
+            collate_fn=dataset_cls.collate_fn,
         )
 
     return dataloader, test_dataloader

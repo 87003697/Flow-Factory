@@ -38,6 +38,7 @@ _MODEL_ADAPTER_REGISTRY: Dict[str, str] = {
     'wan2_i2v': 'flow_factory.models.wan.wan2_i2v.Wan2_I2V_Adapter',
     'wan2_t2v': 'flow_factory.models.wan.wan2_t2v.Wan2_T2V_Adapter',
     'wan2_v2v': 'flow_factory.models.wan.wan2_v2v.Wan2_V2V_Adapter',
+    'trellis2': 'flow_factory.models.trellis2.trellis2.Trellis2Adapter',
 }
 
 def get_model_adapter_class(identifier: str) -> Type:

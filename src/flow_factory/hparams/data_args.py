@@ -54,6 +54,16 @@ class DataArguments(ArgABC):
         default=None,
         metadata={"help": "If set, limits the maximum number of samples in the dataset."},
     )
+    dataset_type: str = field(
+        default="general",
+        metadata={
+            "help": (
+                "Dataset class to use. "
+                "'general': GeneralDataset (RGB images). "
+                "'image_3d': Image3DDataset (RGBA images for 3D generation tasks)."
+            )
+        },
+    )
     preprocess_parallelism: Literal["global", "local"] = field(
         default="local",
         metadata={

@@ -805,6 +805,19 @@ class BaseAdapter(ABC):
                 buf.data = buf.data.to(dtype=frozen_dtype)
         return n_trainable
 
+    def _precision_protected_components(self) -> set:
+        """Components whose dtype should not be touched by ``_mix_precision``.
+
+        Override in subclasses for models with custom mixed-dtype layouts
+        (e.g. Trellis2 flow models with float32 head/tail + bf16 blocks).
+        The subclass is responsible for managing the dtype of these
+        components itself.
+
+        Returns:
+            Set of component names to skip during precision casting.
+        """
+        return set()
+
     def _mix_precision(self):
         """Apply mixed precision to default pipeline modules plus any extra ``target_components`` names."""
         # Get inference and master dtypes
@@ -813,6 +826,7 @@ class BaseAdapter(ABC):
 
         # Get target components and all component names
         target_set = frozenset(self.model_args.target_components)
+        skip_set = self._precision_protected_components()
         component_names = self._resolve_component_names(None)
         merged_names = list(dict.fromkeys([*component_names, *self.model_args.target_components]))
 
@@ -820,11 +834,15 @@ class BaseAdapter(ABC):
         if master_dtype == inference_dtype:
             # Cast all components to inference dtype
             for name in merged_names:
+                if name in skip_set:
+                    continue
                 self.get_component(name).to(dtype=inference_dtype)
             return
 
         trainable_count = 0
         for name in merged_names:
+            if name in skip_set:
+                continue
             component = self.get_component(name)
             if name in target_set:
                 # Cast trainable parameters to master dtype

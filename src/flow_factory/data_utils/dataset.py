@@ -244,6 +244,16 @@ class GeneralDataset(Dataset):
         
         return processed_dataset
 
+    def _load_image(self, path: str) -> Image.Image:
+        """
+        Load a single image from *path*.
+
+        Override in subclasses to change the image mode (e.g. keep RGBA for
+        3-D generation tasks so that background-removal models can skip
+        expensive inference when an alpha mask is already present).
+        """
+        return Image.open(path).convert("RGB")
+
     def _shard_dataset(self, dataset: HFDataset, shard_index: int, num_shards: int) -> HFDataset:
         """
         Split dataset into shards for distributed preprocessing.
@@ -313,7 +323,7 @@ class GeneralDataset(Dataset):
                     if isinstance(img_paths, str):
                         img_paths = [img_paths]
                     images = [
-                        Image.open(_resolve_path(image_dir, img_path)).convert("RGB")
+                        self._load_image(_resolve_path(image_dir, img_path))
                         for img_path in img_paths
                     ]
                     image_pts = [pil_image_to_tensor(img)[0] for img in images]
