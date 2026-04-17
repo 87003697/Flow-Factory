@@ -6,13 +6,19 @@
 # along three axes: Alignment / Coherence / Style (ACS).
 #
 # Prerequisites:
-#   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
-#      CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen3vl-8b \
-#          --served-model-name UnifiedReward --port 8080 \
-#          --limit-mm-per-prompt.image 32 --trust-remote-code \
-#          --gpu-memory-utilization 0.9
+#   1. Start a vLLM server on a separate GPU (e.g., GPU 7). T2I only
+#      sends 1 image per request, so the default upstream cap is
+#      plenty; 32 matches the value used by UnifiedReward's upstream
+#      `vllm_server.sh` and leaves headroom for the I2V example:
+#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen3vl-8b \
+#              --served-model-name UnifiedReward --host 0.0.0.0 --port 8080 \
+#              --trust-remote-code --gpu-memory-utilization 0.9 \
+#              --enable-prefix-caching \
+#              --limit-mm-per-prompt '{"image": 32}'
+#      (vLLM >= 0.20 also accepts the dotted form
+#      `--limit-mm-per-prompt.image 32`.)
 #   2. Use the remaining GPUs for training (e.g., GPU 0-6):
-#      CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/flux1_unified_reward_t2i.yaml
+#          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/flux1_unified_reward_t2i.yaml
 # ============================================================
 
 # Environment Configuration

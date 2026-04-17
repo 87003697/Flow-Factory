@@ -8,13 +8,19 @@
 # sequence so the scorer can evaluate I2V fidelity.
 #
 # Prerequisites:
-#   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
-#      CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen3vl-8b \
-#          --served-model-name UnifiedReward --port 8080 \
-#          --limit-mm-per-prompt.image 32 --trust-remote-code \
-#          --gpu-memory-utilization 0.9
+#   1. Start a vLLM server on a separate GPU (e.g., GPU 7). The
+#      `--limit-mm-per-prompt` flag must bound the per-request image
+#      count to `max_frames + 1` (reference image) or higher; 32 is a
+#      safe default for max_frames=16:
+#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen3vl-8b \
+#              --served-model-name UnifiedReward --host 0.0.0.0 --port 8080 \
+#              --trust-remote-code --gpu-memory-utilization 0.9 \
+#              --enable-prefix-caching \
+#              --limit-mm-per-prompt '{"image": 32}'
+#      (vLLM >= 0.20 also accepts the dotted form
+#      `--limit-mm-per-prompt.image 32`.)
 #   2. Use the remaining GPUs for training (e.g., GPU 0-6):
-#      CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/wan21_i2v_unified_reward.yaml
+#          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/wan21_i2v_unified_reward.yaml
 # ============================================================
 
 # Environment Configuration
