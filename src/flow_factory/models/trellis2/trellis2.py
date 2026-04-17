@@ -352,12 +352,16 @@ class Trellis2Adapter(BaseAdapter):
         from .flow_match_euler_discrete import SparseFlowMatchEulerSDEScheduler
 
         sched_args = self.config.scheduler_args
-        sde_kwargs = {
-            "noise_level":   sched_args.noise_level,
-            "num_sde_steps": sched_args.num_sde_steps,
-            "seed":          sched_args.seed,
-            "dynamics_type": sched_args.dynamics_type,
-        }
+        extra = self.model_args.extra_kwargs or {}
+
+        def _stage_sde_kwargs(stage: str) -> dict:
+            stage_cfg = extra.get(f'{stage}_sde', {})
+            return {
+                "dynamics_type": stage_cfg.get('dynamics_type', sched_args.dynamics_type),
+                "noise_level":   stage_cfg.get('noise_level', sched_args.noise_level),
+                "num_sde_steps": stage_cfg.get('num_sde_steps', sched_args.num_sde_steps),
+                "seed":          sched_args.seed,
+            }
 
         def _make_dense_scheduler() -> FlowMatchEulerDiscreteSDEScheduler:
             params  = self.pipeline.sparse_structure_sampler_params
@@ -371,7 +375,7 @@ class Trellis2Adapter(BaseAdapter):
 
             sched = FlowMatchEulerDiscreteSDEScheduler(
                 num_train_timesteps=1000,
-                **sde_kwargs,
+                **_stage_sde_kwargs('dense'),
             )
             sched.timesteps     = torch.tensor(t_np[:-1] * 1000, dtype=torch.float32)
             sched.sigmas        = torch.tensor(t_np, dtype=torch.float32)
@@ -392,7 +396,7 @@ class Trellis2Adapter(BaseAdapter):
             sched = SparseFlowMatchEulerSDEScheduler(
                 rescale_t   = float(params['rescale_t']),
                 sigma_min   = float(sampler.sigma_min),
-                **sde_kwargs,
+                **_stage_sde_kwargs(stage),
             )
             sched.set_timesteps(int(params['steps']), device='cpu')
             sched._sigma_min = float(sampler.sigma_min)
@@ -933,12 +937,6 @@ class Trellis2Adapter(BaseAdapter):
             else:
                 pred_v = pred_pos.float()
 
-            if self._mode == 'eval':
-                delta = t_val - t_next_val
-                next_lats = latents.float() - delta * pred_v  # (B, C, D, H, W)
-                return SDESchedulerOutput.from_dict({
-                    'next_latents': next_lats, 'noise_pred': pred_v, 'log_prob': None,
-                })
             return scheduler.step(
                 noise_pred=pred_v, timestep=t_val * 1000, latents=latents,
                 next_latents=next_latents, timestep_next=t_next_val * 1000,
@@ -1410,25 +1408,16 @@ class Trellis2Adapter(BaseAdapter):
 
             pred_v = pred_v.float()
 
-            if self._mode == 'eval':
-                delta = t_val - t_next_val
-                current = current.float() - delta * pred_v  # (B, C, D, H, W)
-                output = SDESchedulerOutput.from_dict({
-                    'next_latents': current,
-                    'noise_pred':   pred_v,
-                    'log_prob':     None,
-                })
-            else:
-                output = scheduler.step(
-                    noise_pred=pred_v,
-                    timestep=t_val * 1000,
-                    latents=current,
-                    next_latents=None,
-                    timestep_next=t_next_val * 1000,
-                    noise_level=noise_level_i,
-                    compute_log_prob=step_compute_lp,
-                )
-                current = output.next_latents
+            output = scheduler.step(
+                noise_pred=pred_v,
+                timestep=t_val * 1000,
+                latents=current,
+                next_latents=None,
+                timestep_next=t_next_val * 1000,
+                noise_level=noise_level_i,
+                compute_log_prob=step_compute_lp,
+            )
+            current = output.next_latents
 
             latent_collector.collect(current.unsqueeze(0), i + 1)
             callback_collector.collect_step(i, output, extra_call_back_kwargs)
