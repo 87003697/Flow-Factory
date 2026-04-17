@@ -1,4 +1,4 @@
-# Copyright 2026 Flow-Factory Contributors
+# Copyright 2026 Jayce-Ping
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,20 +14,15 @@
 
 # src/flow_factory/rewards/unified_reward.py
 """
-UnifiedReward API-based reward models for image and video generation.
+UnifiedReward 2.0 API-based reward models for image and video generation.
 
-Provides two pointwise families:
+Provides the **structured pointwise family** aligned with UnifiedReward
+2.0's upstream ACS/APS API prompts: extracts multiple axis scores
+(e.g. Alignment/Coherence/Style) and aggregates them into a single
+reward via configurable weights.  All models share the same API
+transport layer (``UnifiedRewardAPIBase``).
 
-- **Structured (recommended)**: extracts multiple axis scores
-  (e.g. Alignment/Coherence/Style) and aggregates them into a single
-  reward via configurable weights.  Aligned with UnifiedReward 2.0.
-- **Scalar (deprecated)**: extracts a single ``Final Score:`` from the
-  VLM response.  No corresponding upstream 2.0 API prompt exists;
-  prefer the structured variants instead.
-
-Both families share the same API transport layer (``UnifiedRewardAPIBase``).
-
-Recommended YAML config (structured, image generation ACS):
+Recommended YAML config (image generation ACS):
     rewards:
       - name: "unified_reward_image_acs"
         reward_model: "unified_reward_image_acs"
@@ -38,7 +33,7 @@ Recommended YAML config (structured, image generation ACS):
         coherence_weight: 0.5
         style_weight: 0.5
 
-Recommended YAML config (structured, video generation APS):
+Recommended YAML config (video generation APS):
     rewards:
       - name: "unified_reward_video_aps"
         reward_model: "unified_reward_video_aps"
@@ -48,6 +43,7 @@ Recommended YAML config (structured, video generation APS):
         alignment_weight: 1.0
         physics_weight: 1.0
         style_weight: 1.0
+        max_frames: 16
 """
 from __future__ import annotations
 
@@ -56,9 +52,9 @@ import hashlib
 import logging
 import random
 import re
-import warnings
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from PIL import Image
@@ -135,6 +131,15 @@ class UnifiedRewardAPIBase(PointwiseRewardModel):
 
         If all entries are NaN, replaces with 0.0 as a safe fallback.
         Logs a warning when NaN replacement occurs.
+
+        Note:
+            Intentional design per Constraint #26 (fail-fast exemption
+            for documented auto-fallback): partial API failures are
+            tolerated by filling with the batch mean rather than
+            raising, to avoid aborting a training step over a transient
+            network error against a remote vLLM server.  A warning is
+            always emitted (see below) so silent data corruption is
+            impossible.  Upstream Pref-GRPO follows the same policy.
         """
         nan_mask = torch.isnan(rewards)
         nan_count = nan_mask.sum().item()
@@ -194,235 +199,6 @@ class UnifiedRewardAPIBase(PointwiseRewardModel):
         raise RuntimeError(
             f"UnifiedReward API failed after {self.max_retries} retries: " f"{last_error}"
         )
-
-
-class UnifiedRewardScalarPointwiseBase(UnifiedRewardAPIBase):
-    """
-    Scalar pointwise family: extracts a single numeric score from VLM
-    response text via ``SCORE_REGEX`` and normalizes by ``SCORE_MAX``.
-
-    Subclasses override ``SCORE_REGEX``, ``SCORE_MAX``, and
-    ``PROMPT_TEMPLATE``.
-    """
-
-    SCORE_REGEX: str = r"Final Score:\s*(\d+(?:\.\d+)?)"
-    SCORE_MAX: float = 1.0
-
-    def _extract_score(self, text: str) -> float:
-        """Extract raw numeric score from VLM response text."""
-        match = re.search(self.SCORE_REGEX, text)
-        if match:
-            return float(match.group(1))
-        return 0.0
-
-    def _normalize_score(self, raw_score: float) -> float:
-        """Normalize raw score to [0, 1]."""
-        return raw_score / self.SCORE_MAX
-
-    def _score_from_text(self, text: str) -> float:
-        """Full pipeline: raw text -> normalized scalar reward."""
-        return self._normalize_score(self._extract_score(text))
-
-
-class UnifiedRewardImageGenRewardModel(UnifiedRewardScalarPointwiseBase):
-    """
-    .. deprecated::
-        Use ``UnifiedRewardImageGenACSRewardModel``
-        (``unified_reward_image_acs``) instead.  The scalar prompt has
-        no corresponding upstream UnifiedReward 2.0 API template.
-
-    UnifiedReward for image generation quality assessment.
-
-    Evaluates caption alignment and overall image quality.
-    Raw score range 1-5, normalized to [0, 1] via ``score / 5``.
-    """
-
-    required_fields = ("prompt", "image")
-
-    PROMPT_TEMPLATE = (
-        "You are given a text caption and a generated image based on "
-        "that caption. Your task is to evaluate this image based on two "
-        "key criteria:\n"
-        "1. Alignment with the Caption: Assess how well this image "
-        "aligns with the provided caption. Consider the accuracy of "
-        "depicted objects, their relationships, and attributes as "
-        "described in the caption.\n"
-        "2. Overall Image Quality: Examine the visual quality of this "
-        "image, including clarity, detail preservation, color accuracy, "
-        "and overall aesthetic appeal.\n"
-        "Based on the above criteria, assign a score from 1 to 5 after "
-        "'Final Score:'.\n"
-        "Your task is provided as follows:\n"
-        "Text Caption: [{prompt}]"
-    )
-    SCORE_REGEX = r"Final Score:\s*([1-5](?:\.\d+)?)"
-    SCORE_MAX = 5.0
-
-    @torch.no_grad()
-    def __call__(
-        self,
-        prompt: List[str],
-        image: Optional[List[Image.Image]] = None,
-        video: Optional[List[List[Image.Image]]] = None,
-    ) -> RewardModelOutput:
-        warnings.warn(
-            "unified_reward_image is deprecated and has no matching "
-            "UnifiedReward 2.0 API prompt. Use unified_reward_image_acs "
-            "(UnifiedRewardImageGenACSRewardModel) instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if image is None and video is not None:
-            image = [v[0] for v in video]
-
-        if image is None:
-            raise ValueError("Either 'image' or 'video' must be provided")
-
-        if len(prompt) != len(image):
-            raise ValueError(f"Mismatch: {len(prompt)} prompts vs {len(image)} images")
-
-        rewards = asyncio.run(self._async_score_batch(prompt, image))
-        reward_tensor = self._replace_nan_with_mean(torch.tensor(rewards, dtype=torch.float32))
-        return RewardModelOutput(rewards=reward_tensor, extra_info={})
-
-    async def _async_score_batch(
-        self, prompts: List[str], images: List[Image.Image]
-    ) -> List[float]:
-        tasks = [self._score_single(p, img) for p, img in zip(prompts, images)]
-        return list(await asyncio.gather(*tasks))
-
-    async def _score_single(self, prompt: str, image: Image.Image) -> float:
-        cache_key = hashlib.md5(
-            (prompt + hashlib.md5(image.tobytes()).hexdigest()).encode()
-        ).hexdigest()
-
-        question = self.PROMPT_TEMPLATE.format(prompt=prompt)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": pil_image_to_base64(image)},
-                    },
-                    {"type": "text", "text": question},
-                ],
-            }
-        ]
-        try:
-            text = await self._query_api_text(messages, cache_key)
-        except RuntimeError:
-            return float("nan")
-        return self._score_from_text(text)
-
-
-class UnifiedRewardVideoGenRewardModel(UnifiedRewardScalarPointwiseBase):
-    """
-    .. deprecated::
-        Use ``UnifiedRewardVideoGenAPSRewardModel``
-        (``unified_reward_video_aps``) instead.  The scalar prompt has
-        no corresponding upstream UnifiedReward 2.0 API template.
-
-    UnifiedReward for video generation quality assessment.
-
-    Evaluates 5 dimensions: visual quality, temporal consistency,
-    dynamic degree, text-to-video alignment, and factual consistency.
-    Raw score range 1-10, normalized to [0, 1] via ``score / 10``.
-
-    Video frames are sent as individual images through the API.
-    """
-
-    required_fields = ("prompt", "video")
-
-    PROMPT_TEMPLATE = (
-        "Suppose you are an expert in judging and evaluating the quality "
-        "of AI-generated videos, please watch the frames of a given "
-        "video and see the text prompt for generating the video.\n"
-        "Then give scores from 5 different dimensions:\n"
-        "(1) visual quality: the quality of the video in terms of "
-        "clearness, resolution, brightness, and color\n"
-        "(2) temporal consistency, the consistency of objects or humans "
-        "in video\n"
-        "(3) dynamic degree, the degree of dynamic changes\n"
-        "(4) text-to-video alignment, the alignment between the text "
-        "prompt and the video content\n"
-        "(5) factual consistency, the consistency of the video content "
-        "with the common-sense and factual knowledge\n\n"
-        "For each dimension, output a number from [1,2,3,4], \n"
-        "in which '1' means 'Bad', '2' means 'Average', '3' means "
-        "'Good', \n"
-        "'4' means 'Real' or 'Perfect' (the video is like a real "
-        "video)\n"
-        "Finally, based on above 5 dimensions, assign a score from 1 "
-        "to 10 after 'Final Score:'\n"
-        "Here is an output example:\n"
-        "visual quality: 4\n"
-        "temporal consistency: 4\n"
-        "dynamic degree: 3\n"
-        "text-to-video alignment: 1\n"
-        "factual consistency: 2\n"
-        "Final Score: 6\n\n"
-        "**Note: In the example above, scores are placeholders meant "
-        "only to demonstrate the format. Your actual evaluation should "
-        "be based on the quality of the given video.**\n"
-        "Your task is provided as follows: Text Prompt: [{prompt}]"
-    )
-    SCORE_REGEX = r"Final Score:\s*(\d+(?:\.\d+)?)"
-    SCORE_MAX = 10.0
-
-    @torch.no_grad()
-    def __call__(
-        self,
-        prompt: List[str],
-        video: Optional[List[List[Image.Image]]] = None,
-    ) -> RewardModelOutput:
-        warnings.warn(
-            "unified_reward_video is deprecated and has no matching "
-            "UnifiedReward 2.0 API prompt. Use unified_reward_video_aps "
-            "(UnifiedRewardVideoGenAPSRewardModel) instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if video is None:
-            raise ValueError("'video' must be provided")
-
-        if len(prompt) != len(video):
-            raise ValueError(f"Mismatch: {len(prompt)} prompts vs {len(video)} videos")
-
-        rewards = asyncio.run(self._async_score_batch(prompt, video))
-        reward_tensor = self._replace_nan_with_mean(torch.tensor(rewards, dtype=torch.float32))
-        return RewardModelOutput(rewards=reward_tensor, extra_info={})
-
-    async def _async_score_batch(
-        self,
-        prompts: List[str],
-        videos: List[List[Image.Image]],
-    ) -> List[float]:
-        tasks = [self._score_single(p, v) for p, v in zip(prompts, videos)]
-        return list(await asyncio.gather(*tasks))
-
-    async def _score_single(self, prompt: str, frames: List[Image.Image]) -> float:
-        frames_hash = hashlib.md5(
-            b"".join(hashlib.md5(f.tobytes()).digest() for f in frames)
-        ).hexdigest()
-        cache_key = hashlib.md5((prompt + frames_hash).encode()).hexdigest()
-
-        question = self.PROMPT_TEMPLATE.format(prompt=prompt)
-        content: list = [
-            {
-                "type": "image_url",
-                "image_url": {"url": pil_image_to_base64(frame)},
-            }
-            for frame in frames
-        ]
-        content.append({"type": "text", "text": question})
-
-        messages = [{"role": "user", "content": content}]
-        try:
-            text = await self._query_api_text(messages, cache_key)
-        except RuntimeError:
-            return float("nan")
-        return self._score_from_text(text)
 
 
 class UnifiedRewardStructuredPointwiseBase(UnifiedRewardAPIBase):
@@ -495,6 +271,36 @@ class UnifiedRewardStructuredPointwiseBase(UnifiedRewardAPIBase):
         aggregated = self._aggregate_scores(normalized)
         return aggregated, normalized
 
+    def _pack_results(
+        self,
+        results: List[Tuple[float, Dict[str, float]]],
+    ) -> RewardModelOutput:
+        """Pack async per-sample scoring results into a ``RewardModelOutput``.
+
+        Args:
+            results: Per-sample ``(aggregated_reward, per_axis_normalized)``
+                tuples in batch order.  ``nan`` in either slot signals an
+                API failure for that sample (replaced with batch mean on
+                the aggregated axis; kept as-is in ``extra_info``).
+
+        Returns:
+            ``RewardModelOutput`` whose ``rewards`` is a ``(batch_size,)``
+            tensor with NaN filled via ``_replace_nan_with_mean``, and
+            ``extra_info`` contains per-axis normalized scores as
+            ``(batch_size,)`` tensors keyed by ``"{axis}_scores"``.
+        """
+        rewards = [r[0] for r in results]
+        per_axis = {
+            f"{k}_scores": torch.tensor(
+                [r[1][k] for r in results], dtype=torch.float32
+            )  # (batch_size,)
+            for k in self.AXIS_KEYS
+        }
+        reward_tensor = self._replace_nan_with_mean(
+            torch.tensor(rewards, dtype=torch.float32)  # (batch_size,)
+        )
+        return RewardModelOutput(rewards=reward_tensor, extra_info=per_axis)
+
 
 class UnifiedRewardImageGenACSRewardModel(UnifiedRewardStructuredPointwiseBase):
     """
@@ -535,7 +341,7 @@ class UnifiedRewardImageGenACSRewardModel(UnifiedRewardStructuredPointwiseBase):
         "Coherence Score (1-5): Y\n"
         "Style Score (1-5): Z\n\n"
         "Your task is provided as follows:\n"
-        "Text Caption: [{prompt}]"
+        "Text Caption: [__PROMPT__]"
     )
 
     AXIS_KEYS = ["alignment", "coherence", "style"]
@@ -553,6 +359,9 @@ class UnifiedRewardImageGenACSRewardModel(UnifiedRewardStructuredPointwiseBase):
         prompt: List[str],
         image: Optional[List[Image.Image]] = None,
         video: Optional[List[List[Image.Image]]] = None,
+        condition_images: Optional[List[List[Image.Image]]] = None,
+        condition_videos: Optional[List[List[List[Image.Image]]]] = None,
+        **kwargs,
     ) -> RewardModelOutput:
         if image is None and video is not None:
             image = [v[0] for v in video]
@@ -564,13 +373,7 @@ class UnifiedRewardImageGenACSRewardModel(UnifiedRewardStructuredPointwiseBase):
             raise ValueError(f"Mismatch: {len(prompt)} prompts vs {len(image)} images")
 
         results = asyncio.run(self._async_score_batch(prompt, image))
-        rewards = [r[0] for r in results]
-        per_axis = {
-            f"{k}_scores": torch.tensor([r[1][k] for r in results], dtype=torch.float32)
-            for k in self.AXIS_KEYS
-        }
-        reward_tensor = self._replace_nan_with_mean(torch.tensor(rewards, dtype=torch.float32))
-        return RewardModelOutput(rewards=reward_tensor, extra_info=per_axis)
+        return self._pack_results(results)
 
     async def _async_score_batch(
         self, prompts: List[str], images: List[Image.Image]
@@ -578,15 +381,15 @@ class UnifiedRewardImageGenACSRewardModel(UnifiedRewardStructuredPointwiseBase):
         tasks = [self._score_single(p, img) for p, img in zip(prompts, images)]
         return list(await asyncio.gather(*tasks))
 
-    async def _score_single(
-        self, prompt: str, image: Image.Image
-    ) -> Tuple[float, Dict[str, float]]:
-        cache_key = hashlib.md5(
-            (prompt + hashlib.md5(image.tobytes()).hexdigest()).encode()
-        ).hexdigest()
+    def _build_cache_key(self, prompt: str, image: Image.Image) -> str:
+        """Compute a deterministic cache key from prompt and image bytes."""
+        image_hash = hashlib.md5(image.tobytes()).hexdigest()
+        return hashlib.md5((prompt + image_hash).encode()).hexdigest()
 
-        question = self.PROMPT_TEMPLATE.format(prompt=prompt)
-        messages = [
+    def _build_messages(self, prompt: str, image: Image.Image) -> list:
+        """Assemble the OpenAI-compatible chat messages for an image sample."""
+        question = self.PROMPT_TEMPLATE.replace("__PROMPT__", prompt)
+        return [
             {
                 "role": "user",
                 "content": [
@@ -598,6 +401,13 @@ class UnifiedRewardImageGenACSRewardModel(UnifiedRewardStructuredPointwiseBase):
                 ],
             }
         ]
+
+    async def _score_single(
+        self, prompt: str, image: Image.Image
+    ) -> Tuple[float, Dict[str, float]]:
+        """Score a single image sample via VLM API."""
+        cache_key = self._build_cache_key(prompt, image)
+        messages = self._build_messages(prompt, image)
         try:
             text = await self._query_api_text(messages, cache_key)
         except RuntimeError:
@@ -615,7 +425,17 @@ class UnifiedRewardVideoGenAPSRewardModel(UnifiedRewardStructuredPointwiseBase):
     weighted average controlled by ``alignment_weight``,
     ``physics_weight``, ``style_weight`` in the YAML config.
 
-    Video frames are sent as individual images through the API.
+    Video frames are sent as individual images through the API.  Long
+    clips are uniformly sub-sampled down to ``max_frames`` frames to
+    respect the upstream vLLM server's ``--limit-mm-per-prompt.image``
+    bound.  When ``condition_images`` is provided (I2V), the first
+    reference image of each sample is prepended to the frame sequence
+    so the scorer can evaluate subject/style fidelity.
+
+    Extra kwargs (in addition to those from ``UnifiedRewardAPIBase``):
+        max_frames (int): Maximum frames sent to the VLM API. Frames
+            are uniformly sampled when the video exceeds this limit.
+            Default: 16 (matches the upstream APS reference script).
 
     Usage in YAML config:
         rewards:
@@ -627,9 +447,10 @@ class UnifiedRewardVideoGenAPSRewardModel(UnifiedRewardStructuredPointwiseBase):
             alignment_weight: 1.0
             physics_weight: 1.0
             style_weight: 1.0
+            max_frames: 16
     """
 
-    required_fields = ("prompt", "video")
+    required_fields = ("prompt", "video", "condition_images")
 
     PROMPT_TEMPLATE = (
         "You are presented with a generated video and its associated text caption. "
@@ -647,7 +468,7 @@ class UnifiedRewardVideoGenAPSRewardModel(UnifiedRewardStructuredPointwiseBase):
         "Physics Score (1-5): Y\n"
         "Style Score (1-5): Z\n\n"
         "Your task is provided as follows:\n"
-        "Text Caption: [{prompt}]"
+        "Text Caption: [__PROMPT__]"
     )
 
     AXIS_KEYS = ["alignment", "physics", "style"]
@@ -659,11 +480,35 @@ class UnifiedRewardVideoGenAPSRewardModel(UnifiedRewardStructuredPointwiseBase):
     AXIS_MAX = {"alignment": 5.0, "physics": 5.0, "style": 5.0}
     DEFAULT_AXIS_WEIGHTS = {"alignment": 1.0, "physics": 1.0, "style": 1.0}
 
+    def __init__(self, config: RewardArguments, accelerator: Accelerator):
+        super().__init__(config, accelerator)
+        self.max_frames = config.extra_kwargs.get("max_frames", 16)
+
+    def _sample_frames(self, frames: List[Image.Image]) -> List[Image.Image]:
+        """Uniformly sample ``frames`` down to ``self.max_frames`` if needed.
+
+        Args:
+            frames: Full per-sample frame list (PIL Images).
+
+        Returns:
+            A sub-sampled list whose length is at most ``self.max_frames``.
+            When the input already fits, the original list is returned
+            unchanged.
+        """
+        if len(frames) <= self.max_frames:
+            return frames
+        indices = np.linspace(0, len(frames) - 1, self.max_frames, dtype=int)  # (max_frames,)
+        return [frames[i] for i in indices]
+
     @torch.no_grad()
     def __call__(
         self,
         prompt: List[str],
+        image: Optional[List[Image.Image]] = None,
         video: Optional[List[List[Image.Image]]] = None,
+        condition_images: Optional[List[List[Image.Image]]] = None,
+        condition_videos: Optional[List[List[List[Image.Image]]]] = None,
+        **kwargs,
     ) -> RewardModelOutput:
         if video is None:
             raise ValueError("'video' must be provided")
@@ -671,42 +516,108 @@ class UnifiedRewardVideoGenAPSRewardModel(UnifiedRewardStructuredPointwiseBase):
         if len(prompt) != len(video):
             raise ValueError(f"Mismatch: {len(prompt)} prompts vs {len(video)} videos")
 
-        results = asyncio.run(self._async_score_batch(prompt, video))
-        rewards = [r[0] for r in results]
-        per_axis = {
-            f"{k}_scores": torch.tensor([r[1][k] for r in results], dtype=torch.float32)
-            for k in self.AXIS_KEYS
-        }
-        reward_tensor = self._replace_nan_with_mean(torch.tensor(rewards, dtype=torch.float32))
-        return RewardModelOutput(rewards=reward_tensor, extra_info=per_axis)
+        sampled_videos, cond_imgs = self._prepare_video_inputs(video, condition_images)
+        results = asyncio.run(self._async_score_batch(prompt, sampled_videos, cond_imgs))
+        return self._pack_results(results)
+
+    def _prepare_video_inputs(
+        self,
+        video: List[List[Image.Image]],
+        condition_images: Optional[List[List[Image.Image]]] = None,
+    ) -> Tuple[List[List[Image.Image]], List[Optional[Image.Image]]]:
+        """Sub-sample frames and resolve per-sample condition images.
+
+        Args:
+            video: Per-sample frame sequences.
+            condition_images: Optional per-sample lists of condition images
+                (I2V).  When provided, the first image of each inner list
+                is taken as the reference image for that sample.
+
+        Returns:
+            Tuple ``(sampled_videos, cond_imgs)`` where ``sampled_videos``
+            has each clip sub-sampled to at most ``self.max_frames``
+            frames, and ``cond_imgs`` is aligned with the batch (``None``
+            for pure T2V samples).
+        """
+        cond_imgs: List[Optional[Image.Image]] = [None] * len(video)
+        if condition_images is not None:
+            if len(condition_images) != len(video):
+                raise ValueError(
+                    f"Mismatch: {len(condition_images)} condition_images " f"vs {len(video)} videos"
+                )
+            cond_imgs = [imgs[0] if imgs else None for imgs in condition_images]
+
+        sampled_videos = [self._sample_frames(v) for v in video]
+        return sampled_videos, cond_imgs
 
     async def _async_score_batch(
         self,
         prompts: List[str],
         videos: List[List[Image.Image]],
+        cond_imgs: List[Optional[Image.Image]],
     ) -> List[Tuple[float, Dict[str, float]]]:
-        tasks = [self._score_single(p, v) for p, v in zip(prompts, videos)]
+        tasks = [self._score_single(p, v, c) for p, v, c in zip(prompts, videos, cond_imgs)]
         return list(await asyncio.gather(*tasks))
 
+    def _build_cache_key(
+        self,
+        prompt: str,
+        frames: List[Image.Image],
+        condition_image: Optional[Image.Image] = None,
+    ) -> str:
+        """Compute a deterministic cache key from prompt and all visual inputs.
+
+        The condition image (if any) is hashed first so that different
+        reference images produce distinct cache keys even when the frame
+        sequence is identical.
+        """
+        hash_parts: List[bytes] = []
+        if condition_image is not None:
+            hash_parts.append(hashlib.md5(condition_image.tobytes()).digest())
+        for f in frames:
+            hash_parts.append(hashlib.md5(f.tobytes()).digest())
+        visual_hash = hashlib.md5(b"".join(hash_parts)).hexdigest()
+        return hashlib.md5((prompt + visual_hash).encode()).hexdigest()
+
+    def _build_messages(
+        self,
+        prompt: str,
+        frames: List[Image.Image],
+        condition_image: Optional[Image.Image] = None,
+    ) -> list:
+        """Assemble the OpenAI-compatible chat messages for a video sample.
+
+        When a condition image is present (I2V), it is placed at the front
+        of the image sequence so the scorer can evaluate subject/style
+        fidelity against the reference before the generated frames.
+        """
+        content: list = []
+        if condition_image is not None:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": pil_image_to_base64(condition_image)},
+                }
+            )
+        for frame in frames:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": pil_image_to_base64(frame)},
+                }
+            )
+        content.append({"type": "text", "text": self.PROMPT_TEMPLATE.replace("__PROMPT__", prompt)})
+        return [{"role": "user", "content": content}]
+
     async def _score_single(
-        self, prompt: str, frames: List[Image.Image]
+        self,
+        prompt: str,
+        frames: List[Image.Image],
+        condition_image: Optional[Image.Image] = None,
     ) -> Tuple[float, Dict[str, float]]:
-        frames_hash = hashlib.md5(
-            b"".join(hashlib.md5(f.tobytes()).digest() for f in frames)
-        ).hexdigest()
-        cache_key = hashlib.md5((prompt + frames_hash).encode()).hexdigest()
-
-        question = self.PROMPT_TEMPLATE.format(prompt=prompt)
-        content: list = [
-            {
-                "type": "image_url",
-                "image_url": {"url": pil_image_to_base64(frame)},
-            }
-            for frame in frames
-        ]
-        content.append({"type": "text", "text": question})
-
-        messages = [{"role": "user", "content": content}]
+        """Score a single video sample via VLM API."""
+        cache_key = self._build_cache_key(prompt, frames, condition_image)
+        messages = self._build_messages(prompt, frames, condition_image)
         try:
             text = await self._query_api_text(messages, cache_key)
         except RuntimeError:

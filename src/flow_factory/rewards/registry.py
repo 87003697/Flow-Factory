@@ -34,8 +34,6 @@ _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     "vllm_evaluate": "flow_factory.rewards.vllm_evaluate.VLMEvaluateImageRewardModel",
     "vllm_evaluate_image": "flow_factory.rewards.vllm_evaluate.VLMEvaluateImageRewardModel",
     "vllm_evaluate_video": "flow_factory.rewards.vllm_evaluate.VLMEvaluateVideoRewardModel",
-    "unified_reward_image": "flow_factory.rewards.unified_reward.UnifiedRewardImageGenRewardModel",  # deprecated, use unified_reward_image_acs
-    "unified_reward_video": "flow_factory.rewards.unified_reward.UnifiedRewardVideoGenRewardModel",  # deprecated, use unified_reward_video_aps
     "unified_reward_image_acs": "flow_factory.rewards.unified_reward.UnifiedRewardImageGenACSRewardModel",
     "unified_reward_video_aps": "flow_factory.rewards.unified_reward.UnifiedRewardVideoGenAPSRewardModel",
 }
