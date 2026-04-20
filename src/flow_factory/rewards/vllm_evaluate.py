@@ -145,14 +145,13 @@ class VLMEvaluateBase(PointwiseRewardModel):
         super().__init__(config, accelerator)
 
         try:
-            from openai import AsyncOpenAI
+            import openai  # noqa: F401
         except ImportError:
             raise ImportError(
                 "VLMEvaluateBase requires the `openai` package. "
                 "Install it with: pip install openai"
-            )
+            ) from None
 
-        # Read extra kwargs with defaults
         self.api_base_url = config.extra_kwargs.get("api_base_url", "http://localhost:8000/v1")
         self.api_key = config.extra_kwargs.get("api_key", "EMPTY")
         self.vlm_model = config.extra_kwargs.get("vlm_model", "Qwen3-VL")
@@ -163,15 +162,23 @@ class VLMEvaluateBase(PointwiseRewardModel):
         self.canonicalize = config.extra_kwargs.get("canonicalize", False)
         self.max_cache_size = config.extra_kwargs.get("max_cache_size", 1024)
 
-        # Initialize async OpenAI client
-        self.client = AsyncOpenAI(
+        self._cache: dict[str, float] = {}
+
+    def _make_client(self):
+        """Create a fresh ``AsyncOpenAI`` client for the current event loop.
+
+        A new client must be created per ``asyncio.run()`` call because
+        the internal ``httpx.AsyncClient`` connection pool is bound to the
+        event loop that was active when the first request was made.  Reusing
+        a client across ``asyncio.run()`` boundaries causes *Connection error*
+        since the old event loop has been closed.
+        """
+        from openai import AsyncOpenAI
+
+        return AsyncOpenAI(
             base_url=self.api_base_url,
             api_key=self.api_key,
         )
-        self.semaphore = asyncio.Semaphore(self.max_concurrent)
-
-        # Simple FIFO cache: img_hash -> score
-        self._cache: dict[str, float] = {}
 
     def _add_to_cache(self, key: str, value: float):
         """Add entry to cache with FIFO eviction."""
@@ -179,7 +186,7 @@ class VLMEvaluateBase(PointwiseRewardModel):
             self._cache.pop(next(iter(self._cache)))
         self._cache[key] = value
 
-    async def _request_score(self, messages: list, cache_key: str) -> float:
+    async def _request_score(self, messages: list, cache_key: str, *, client, semaphore) -> float:
         """Send a single VLM request and return P(Yes|Yes,No).
 
         Encapsulates retry logic, concurrency gating, logprob extraction,
@@ -190,8 +197,8 @@ class VLMEvaluateBase(PointwiseRewardModel):
 
         for attempt in range(self.max_retries):
             try:
-                async with self.semaphore:
-                    completion = await self.client.chat.completions.create(
+                async with semaphore:
+                    completion = await client.chat.completions.create(
                         model=self.vlm_model,
                         messages=messages,
                         temperature=0.0,
@@ -278,8 +285,14 @@ class VLMEvaluateImageRewardModel(VLMEvaluateBase):
 
         assert len(prompt) == len(image), f"Mismatch: {len(prompt)} prompts vs {len(image)} images"
 
-        # Run async scoring
-        rewards = asyncio.run(self._async_score_batch(image))
+        async def _run() -> List[float]:
+            client = self._make_client()
+            try:
+                return await self._async_score_batch(image, client)
+            finally:
+                await client.close()
+
+        rewards = asyncio.run(_run())
 
         return RewardModelOutput(
             rewards=torch.tensor(rewards, dtype=torch.float32),  # (batch_size,)
@@ -289,20 +302,21 @@ class VLMEvaluateImageRewardModel(VLMEvaluateBase):
     async def _async_score_batch(
         self,
         images: List[Image.Image],
+        client,
     ) -> List[float]:
         """Score all images in the batch concurrently."""
-        tasks = [self._score_single(img) for img in images]
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        tasks = [self._score_single(img, client=client, semaphore=semaphore) for img in images]
         return list(await asyncio.gather(*tasks))
 
     async def _score_single(
         self,
         image: Image.Image,
+        *,
+        client,
+        semaphore,
     ) -> float:
-        """
-        Query the VLM for a single image and return P(Yes|Yes,No).
-
-        Uses caching to avoid redundant API calls and retries on failure.
-        """
+        """Query the VLM for a single image and return P(Yes|Yes,No)."""
         cache_key = hashlib.md5(image.tobytes()).hexdigest()
         messages = [
             {
@@ -313,7 +327,7 @@ class VLMEvaluateImageRewardModel(VLMEvaluateBase):
                 ],
             }
         ]
-        return await self._request_score(messages, cache_key)
+        return await self._request_score(messages, cache_key, client=client, semaphore=semaphore)
 
 
 VLMEvaluateRewardModel = VLMEvaluateImageRewardModel
@@ -420,7 +434,15 @@ class VLMEvaluateVideoRewardModel(VLMEvaluateBase):
             cond_imgs = [imgs[0] if imgs else None for imgs in condition_images]
 
         sampled_videos = [self._sample_frames(v) for v in video]
-        rewards = asyncio.run(self._async_score_batch(sampled_videos, cond_imgs))
+
+        async def _run() -> List[float]:
+            client = self._make_client()
+            try:
+                return await self._async_score_batch(sampled_videos, cond_imgs, client)
+            finally:
+                await client.close()
+
+        rewards = asyncio.run(_run())
 
         return RewardModelOutput(
             rewards=torch.tensor(rewards, dtype=torch.float32),  # (batch_size,)
@@ -431,10 +453,13 @@ class VLMEvaluateVideoRewardModel(VLMEvaluateBase):
         self,
         videos: List[List[Image.Image]],
         cond_imgs: List[Optional[Image.Image]],
+        client,
     ) -> List[float]:
         """Score all videos in the batch concurrently."""
+        semaphore = asyncio.Semaphore(self.max_concurrent)
         tasks = [
-            self._score_single(frames, cond_img) for frames, cond_img in zip(videos, cond_imgs)
+            self._score_single(frames, cond_img, client=client, semaphore=semaphore)
+            for frames, cond_img in zip(videos, cond_imgs)
         ]
         return list(await asyncio.gather(*tasks))
 
@@ -480,8 +505,11 @@ class VLMEvaluateVideoRewardModel(VLMEvaluateBase):
         self,
         frames: List[Image.Image],
         condition_image: Optional[Image.Image] = None,
+        *,
+        client,
+        semaphore,
     ) -> float:
         """Score a single video sample via VLM API."""
         cache_key = self._build_cache_key(frames, condition_image)
         messages = self._build_messages(frames, condition_image)
-        return await self._request_score(messages, cache_key)
+        return await self._request_score(messages, cache_key, client=client, semaphore=semaphore)

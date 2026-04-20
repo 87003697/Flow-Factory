@@ -8,6 +8,7 @@ Flow-Factory provides a flexible reward model system that supports both built-in
 - [Built-in Reward Models](#built-in-reward-models)
 - [Using Built-in Reward Models](#using-built-in-reward-models)
 - [UnifiedReward Notes](#unifiedreward-notes)
+  - [Pairwise Win-Rate Models](#pairwise-win-rate-models)
 - [Creating Custom Reward Models](#creating-custom-reward-models)
   - [Pointwise Reward Model](#pointwise-reward-model)
   - [Groupwise Reward Model](#groupwise-reward-model)
@@ -40,6 +41,10 @@ Flow-Factory supports two paradigms for computing rewards:
 | `vllm_evaluate` | Pointwise | OpenAI-compatible VLM Yes/No evaluation via logprobs | N/A |
 | `unified_reward_image_acs` | Pointwise | UnifiedReward 2.0 image generation structured scoring (Alignment/Coherence/Style) | [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward) |
 | `unified_reward_video_aps` | Pointwise | UnifiedReward 2.0 video generation structured scoring (Alignment/Physics/Style) | [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward) |
+| `unified_reward_think_image_pairwise` | Groupwise | Pairwise win-rate for images (think mode, CoT) | [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward) |
+| `unified_reward_think_video_pairwise` | Groupwise | Pairwise win-rate for videos (think mode, CoT) | [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward) |
+| `unified_reward_flex_image_pairwise` | Groupwise | Pairwise win-rate for images (flex mode, JSON per-category) | [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward) |
+| `unified_reward_flex_video_pairwise` | Groupwise | Pairwise win-rate for videos (flex mode, JSON per-category) | [UnifiedReward](https://github.com/CodeGoat24/UnifiedReward) |
 | `PickScore_Rank` | Groupwise | Ranking-based reward using PickScore | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
 
 ## Using Built-in Reward Models
@@ -78,9 +83,6 @@ Structured models return the aggregated reward in `RewardModelOutput.rewards` an
 
 ### Explicitly Out of Scope Today
 
-- Pairwise or ranking-based UnifiedReward modes
-- Any integration that requires `GroupwiseRewardModel`
-- UnifiedReward 2.0 pair-score outputs
 - Image/video understanding modes that require extra fields such as `question` and `response`
 
 ### Why the Upstream Modes Differ
@@ -103,6 +105,13 @@ PointwiseRewardModel
        └─ UnifiedRewardStructuredPointwiseBase   (multi-axis: extract → normalize → aggregate)
             ├─ UnifiedRewardImageGenACSRewardModel (unified_reward_image_acs)
             └─ UnifiedRewardVideoGenAPSRewardModel (unified_reward_video_aps)
+
+GroupwiseRewardModel
+  └─ UnifiedRewardPairwiseBase     (pairwise win-rate: pair enumeration, API transport, aggregation)
+       ├─ UnifiedRewardThinkImagePairwise  (unified_reward_think_image_pairwise)
+       ├─ UnifiedRewardThinkVideoPairwise  (unified_reward_think_video_pairwise)
+       ├─ UnifiedRewardFlexImagePairwise   (unified_reward_flex_image_pairwise)
+       └─ UnifiedRewardFlexVideoPairwise   (unified_reward_flex_video_pairwise)
 ```
 
 ### Example Configs
@@ -135,6 +144,84 @@ rewards:
 ```
 
 For image-to-video (I2V) tasks, if the sample carries `condition_images`, the first reference image of each sample is automatically prepended to the frame sequence so the scorer can evaluate subject/style fidelity to the reference.  No extra config is required.
+
+### Pairwise Win-Rate Models
+
+The pairwise family evaluates all C(K, 2) pairs within a group via the VLM API and aggregates per-sample win rates.  Two evaluation modes are available:
+
+| Mode | VLM Output | Best For |
+|------|-----------|----------|
+| **think** | CoT reasoning + `<answer>Image/Video 1/2 is better</answer>` | Simple and fast; good starting point |
+| **flex** | Structured JSON with per-category winners and overall winner | Multi-dimensional analysis with configurable weights |
+
+**Think mode (image, recommended starting point)**:
+```yaml
+rewards:
+  - name: "pairwise_think"
+    reward_model: "unified_reward_think_image_pairwise"
+    api_base_url: "http://localhost:8080/v1"
+    vlm_model: "UnifiedReward-Think"
+    max_pairs: 32
+    async_reward: true
+    num_workers: 4
+    max_concurrent: 32
+```
+
+**Flex mode (image, multi-dimensional weighting)**:
+```yaml
+rewards:
+  - name: "pairwise_flex"
+    reward_model: "unified_reward_flex_image_pairwise"
+    api_base_url: "http://localhost:8080/v1"
+    vlm_model: "UnifiedReward"
+    overall_weight: 1.0
+    dim_weight: 1.0
+    category_weights: [1.0, 1.0, 0.5]
+    max_pairs: 32
+    async_reward: true
+    num_workers: 4
+    max_concurrent: 32
+```
+
+**Video pairwise**:
+```yaml
+rewards:
+  - name: "pairwise_video"
+    reward_model: "unified_reward_think_video_pairwise"
+    api_base_url: "http://localhost:8080/v1"
+    vlm_model: "UnifiedReward-Think"
+    max_frames: 8
+    max_pairs: 28
+    async_reward: true
+    num_workers: 4
+    max_concurrent: 16
+```
+
+**Key parameters**:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_pairs` | `None` (all) | Cap on number of pairs.  C(8,2)=28, C(16,2)=120 — set this to control API cost for large groups |
+| `max_frames` | `8` | Max frames **per video** sent to VLM.  One pair comparison sends `2 × max_frames` frames total |
+| `max_concurrent` | `64` | Max concurrent API requests within a single group's `asyncio.gather` |
+| `overall_weight` | `1.0` | (flex only) Weight for the overall winner in reward aggregation |
+| `dim_weight` | `1.0` | (flex only) Weight for the per-category mean win rate |
+| `category_weights` | `None` | (flex only) Per-category weights; supports YAML list or comma-separated string |
+
+**Concurrency model with `async_reward`**:
+
+When `async_reward: true` is set, the `RewardBuffer` dispatches each group to a `ThreadPoolExecutor` worker.  Each worker runs `asyncio.run()` with its own event loop, client, and semaphore:
+
+```
+num_workers=4, max_concurrent=32:
+  Thread 1 → asyncio.gather(pairs for group 0) → up to 32 concurrent API calls
+  Thread 2 → asyncio.gather(pairs for group 1) → up to 32 concurrent API calls
+  Thread 3 → asyncio.gather(pairs for group 2) → up to 32 concurrent API calls
+  Thread 4 → asyncio.gather(pairs for group 3) → up to 32 concurrent API calls
+  Total in-flight = num_workers × max_concurrent = 128
+```
+
+GPU sample generation and API scoring run in parallel (pipelining is handled by the existing `RewardBuffer`).
 
 ## Creating Custom Reward Models
 

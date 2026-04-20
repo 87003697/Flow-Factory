@@ -95,12 +95,12 @@ class UnifiedRewardAPIBase(PointwiseRewardModel):
         super().__init__(config, accelerator)
 
         try:
-            from openai import AsyncOpenAI
+            import openai  # noqa: F401
         except ImportError:
             raise ImportError(
                 "UnifiedReward requires the `openai` package. "
                 "Install it with: pip install openai"
-            )
+            ) from None
 
         self.api_base_url = config.extra_kwargs.get("api_base_url", "http://localhost:8080/v1")
         self.api_key = config.extra_kwargs.get("api_key", "EMPTY")
@@ -111,13 +111,23 @@ class UnifiedRewardAPIBase(PointwiseRewardModel):
         self.max_tokens = config.extra_kwargs.get("max_tokens", 4096)
         self.max_cache_size = config.extra_kwargs.get("max_cache_size", 1024)
 
-        self.client = AsyncOpenAI(
+        self._text_cache: dict[str, str] = {}
+
+    def _make_client(self):
+        """Create a fresh ``AsyncOpenAI`` client for the current event loop.
+
+        A new client must be created per ``asyncio.run()`` call because
+        the internal ``httpx.AsyncClient`` connection pool is bound to the
+        event loop that was active when the first request was made.  Reusing
+        a client across ``asyncio.run()`` boundaries (even on the same
+        thread) causes *Connection error* since the old loop has been closed.
+        """
+        from openai import AsyncOpenAI
+
+        return AsyncOpenAI(
             base_url=self.api_base_url,
             api_key=self.api_key,
         )
-        self.semaphore = asyncio.Semaphore(self.max_concurrent)
-
-        self._text_cache: dict[str, str] = {}
 
     def _add_to_cache(self, key: str, value: str):
         """Add entry to text cache with FIFO eviction."""
@@ -159,20 +169,41 @@ class UnifiedRewardAPIBase(PointwiseRewardModel):
         rewards[nan_mask] = fill_value
         return rewards
 
-    async def _query_api_text(self, messages: list, cache_key: str) -> str:
+    async def _query_api_text(
+        self,
+        messages: list,
+        cache_key: str,
+        semaphore: asyncio.Semaphore | None = None,
+        *,
+        client=None,
+    ) -> str:
         """Send a single request to the VLM and return the raw response text.
+
+        Args:
+            semaphore: Concurrency limiter created inside the current
+                ``asyncio.run()`` call.  Must belong to the running event
+                loop — never store a semaphore as an instance attribute.
+            client: ``AsyncOpenAI`` instance bound to the current event loop.
 
         Raises:
             RuntimeError: If all retry attempts are exhausted.
         """
         if cache_key in self._text_cache:
             return self._text_cache[cache_key]
-
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                async with self.semaphore:
-                    completion = await self.client.chat.completions.create(
+                if semaphore is not None:
+                    async with semaphore:
+                        completion = await client.chat.completions.create(
+                            model=self.vlm_model,
+                            messages=messages,
+                            temperature=0.0,
+                            max_tokens=self.max_tokens,
+                            timeout=self.timeout,
+                        )
+                else:
+                    completion = await client.chat.completions.create(
                         model=self.vlm_model,
                         messages=messages,
                         temperature=0.0,
@@ -197,7 +228,7 @@ class UnifiedRewardAPIBase(PointwiseRewardModel):
                     await asyncio.sleep(sleep_time)
 
         raise RuntimeError(
-            f"UnifiedReward API failed after {self.max_retries} retries: " f"{last_error}"
+            f"UnifiedReward API failed after {self.max_retries} retries: {last_error}"
         )
 
 
@@ -372,13 +403,21 @@ class UnifiedRewardImageGenACSRewardModel(UnifiedRewardStructuredPointwiseBase):
         if len(prompt) != len(image):
             raise ValueError(f"Mismatch: {len(prompt)} prompts vs {len(image)} images")
 
-        results = asyncio.run(self._async_score_batch(prompt, image))
+        async def _run() -> List[Tuple[float, Dict[str, float]]]:
+            client = self._make_client()
+            try:
+                return await self._async_score_batch(prompt, image, client)
+            finally:
+                await client.close()
+
+        results = asyncio.run(_run())
         return self._pack_results(results)
 
     async def _async_score_batch(
-        self, prompts: List[str], images: List[Image.Image]
+        self, prompts: List[str], images: List[Image.Image], client,
     ) -> List[Tuple[float, Dict[str, float]]]:
-        tasks = [self._score_single(p, img) for p, img in zip(prompts, images)]
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        tasks = [self._score_single(p, img, semaphore, client) for p, img in zip(prompts, images)]
         return list(await asyncio.gather(*tasks))
 
     def _build_cache_key(self, prompt: str, image: Image.Image) -> str:
@@ -403,13 +442,13 @@ class UnifiedRewardImageGenACSRewardModel(UnifiedRewardStructuredPointwiseBase):
         ]
 
     async def _score_single(
-        self, prompt: str, image: Image.Image
+        self, prompt: str, image: Image.Image, semaphore: asyncio.Semaphore, client,
     ) -> Tuple[float, Dict[str, float]]:
         """Score a single image sample via VLM API."""
         cache_key = self._build_cache_key(prompt, image)
         messages = self._build_messages(prompt, image)
         try:
-            text = await self._query_api_text(messages, cache_key)
+            text = await self._query_api_text(messages, cache_key, semaphore, client=client)
         except RuntimeError:
             nan = float("nan")
             return nan, {k: nan for k in self.AXIS_KEYS}
@@ -517,7 +556,15 @@ class UnifiedRewardVideoGenAPSRewardModel(UnifiedRewardStructuredPointwiseBase):
             raise ValueError(f"Mismatch: {len(prompt)} prompts vs {len(video)} videos")
 
         sampled_videos, cond_imgs = self._prepare_video_inputs(video, condition_images)
-        results = asyncio.run(self._async_score_batch(prompt, sampled_videos, cond_imgs))
+
+        async def _run() -> List[Tuple[float, Dict[str, float]]]:
+            client = self._make_client()
+            try:
+                return await self._async_score_batch(prompt, sampled_videos, cond_imgs, client)
+            finally:
+                await client.close()
+
+        results = asyncio.run(_run())
         return self._pack_results(results)
 
     def _prepare_video_inputs(
@@ -555,8 +602,13 @@ class UnifiedRewardVideoGenAPSRewardModel(UnifiedRewardStructuredPointwiseBase):
         prompts: List[str],
         videos: List[List[Image.Image]],
         cond_imgs: List[Optional[Image.Image]],
+        client,
     ) -> List[Tuple[float, Dict[str, float]]]:
-        tasks = [self._score_single(p, v, c) for p, v, c in zip(prompts, videos, cond_imgs)]
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        tasks = [
+            self._score_single(p, v, c, semaphore, client)
+            for p, v, c in zip(prompts, videos, cond_imgs)
+        ]
         return list(await asyncio.gather(*tasks))
 
     def _build_cache_key(
@@ -613,13 +665,15 @@ class UnifiedRewardVideoGenAPSRewardModel(UnifiedRewardStructuredPointwiseBase):
         self,
         prompt: str,
         frames: List[Image.Image],
-        condition_image: Optional[Image.Image] = None,
+        condition_image: Optional[Image.Image],
+        semaphore: asyncio.Semaphore,
+        client,
     ) -> Tuple[float, Dict[str, float]]:
         """Score a single video sample via VLM API."""
         cache_key = self._build_cache_key(prompt, frames, condition_image)
         messages = self._build_messages(prompt, frames, condition_image)
         try:
-            text = await self._query_api_text(messages, cache_key)
+            text = await self._query_api_text(messages, cache_key, semaphore, client=client)
         except RuntimeError:
             nan = float("nan")
             return nan, {k: nan for k in self.AXIS_KEYS}
