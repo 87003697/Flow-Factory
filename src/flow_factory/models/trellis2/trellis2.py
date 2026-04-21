@@ -84,10 +84,11 @@ def _compute_adaptive_distance(
     fill_ratio: float = 0.9,
     object_half_size: float = 0.5,
 ) -> float:
-    """根据 FOV 和填充率计算相机距离，使物体恰好占据指定比例的视野。
+    """Compute camera distance from FOV and fill ratio.
 
-    TRELLIS mesh 归一化到 [-0.5, 0.5]^3，所以 object_half_size=0.5。
-    推导：r = object_half_size / (fill_ratio × tan(FOV/2))
+    TRELLIS meshes are normalized to ``[-0.5, 0.5]^3``, so
+    ``object_half_size=0.5`` is the natural default.
+    Derivation: ``r = object_half_size / (fill_ratio * tan(FOV / 2))``.
     """
     import math
     tan_half_fov = math.tan(math.radians(fov_deg) / 2)
@@ -158,24 +159,55 @@ class Trellis2Sample(ImageConditionSample):
     # ============ Per-stage: Dense (Stage 1, cond @ 512) ============
     dense_image_cond: Optional[torch.Tensor] = None     # (seq_512, D)
     dense_neg_image_cond: Optional[torch.Tensor] = None  # (seq_512, D)
-    dense_all_latents: Optional[torch.Tensor] = None     # (T, H*W*D, C)
+    dense_final_latent: Optional[torch.Tensor] = None    # (B, C, D, H, W) — final denoised latent (always set)
+    dense_all_latents: Optional[torch.Tensor] = None     # (T, B, C, D, H, W) — trajectory for training (may be None)
     dense_log_probs: Optional[torch.Tensor] = None       # (T,)
+    dense_latent_index_map: Optional[torch.Tensor] = None
+    dense_log_prob_index_map: Optional[torch.Tensor] = None
+    dense_timesteps: Optional[torch.Tensor] = None
     
     # ============ Per-stage: Shape (Stage 2A, cond @ 1024) ============
     shape_image_cond: Optional[torch.Tensor] = None     # (seq_1024, D)
     shape_neg_image_cond: Optional[torch.Tensor] = None  # (seq_1024, D)
-    shape_all_latents: Optional[torch.Tensor] = None     # (T, N, C_shape)
+    shape_final_latent: Optional[torch.Tensor] = None    # (N, C_shape) — final denoised latent (always set)
+    shape_all_latents: Optional[torch.Tensor] = None     # (T, N, C_shape) — trajectory for training (may be None)
     shape_log_probs: Optional[torch.Tensor] = None       # (T,)
+    shape_latent_index_map: Optional[torch.Tensor] = None
+    shape_log_prob_index_map: Optional[torch.Tensor] = None
+    shape_timesteps: Optional[torch.Tensor] = None
     
     # ============ Per-stage: Tex (Stage 2B, cond @ 1024) ============
     tex_image_cond: Optional[torch.Tensor] = None       # (seq_1024, D)
     tex_neg_image_cond: Optional[torch.Tensor] = None    # (seq_1024, D)
-    tex_all_latents: Optional[torch.Tensor] = None       # (T, N, C_tex)
+    tex_final_latent: Optional[torch.Tensor] = None      # (N, C_tex) — final denoised latent (always set)
+    tex_all_latents: Optional[torch.Tensor] = None       # (T, N, C_tex) — trajectory for training (may be None)
     tex_log_probs: Optional[torch.Tensor] = None         # (T,)
     tex_concat_cond: Optional[torch.Tensor] = None       # (N, C_shape) — normalized shape features
+    tex_latent_index_map: Optional[torch.Tensor] = None
+    tex_log_prob_index_map: Optional[torch.Tensor] = None
+    tex_timesteps: Optional[torch.Tensor] = None
     
     # ============ Output (for reward / eval) ============
     mesh: Optional[Any] = None
+
+    _STAGE_FIELD_MAP = {
+        'all_latents', 'log_probs', 'image_cond', 'neg_image_cond',
+        'latent_index_map', 'log_prob_index_map', 'timesteps',
+    }
+
+    def activate_stage(self, stage: str) -> None:
+        """Project per-stage fields to standard fields for training.
+
+        For single-stage training, called once after inference.
+        For multi-stage training, the Trainer calls this before each
+        stage's optimize loop to switch which data the standard fields
+        (``all_latents``, ``log_probs``, etc.) point to.
+        """
+        for field_name in self._STAGE_FIELD_MAP:
+            per_stage_name = f'{stage}_{field_name}'
+            value = getattr(self, per_stage_name, None)
+            if value is not None:
+                setattr(self, field_name, value)
 
     @classmethod
     def _stack_values(cls, key: str, values: list):
@@ -329,13 +361,18 @@ class Trellis2Adapter(BaseAdapter):
         if rembg_model_path:
             logger.info(f"Using local RMBG model: {rembg_model_path}")
         
-        return Trellis2PseudoPipeline.from_pretrained(
+        pipeline = Trellis2PseudoPipeline.from_pretrained(
             model_path,
             target_flow_model=target_flow_model,
             low_cpu_mem_usage=False,
             image_cond_model_path=image_cond_model_path,
             rembg_model_path=rembg_model_path,
         )
+        for decoder in filter(None, [pipeline.shape_decoder, pipeline.tex_decoder]):
+            decoder.convert_to_fp32()
+            decoder.dtype = torch.float32
+            decoder.use_fp16 = False
+        return pipeline
     
     def load_scheduler(self):
         """
@@ -406,7 +443,8 @@ class Trellis2Adapter(BaseAdapter):
         self.pipeline.scheduler_shape = _make_sparse_scheduler('shape')
         self.pipeline.scheduler_tex   = _make_sparse_scheduler('tex')
 
-        return self.pipeline.scheduler_shape
+        train_stage = self.pipeline._target_flow_model.split('_')[0]
+        return self._get_stage_scheduler(train_stage)
 
     def _precision_protected_components(self) -> set:
         """All Trellis2 flow models use a custom mixed-dtype layout
@@ -429,6 +467,42 @@ class Trellis2Adapter(BaseAdapter):
         """Trellis2 uses image conditioning, no text encoders to freeze."""
         pass
 
+    def enable_gradient_checkpointing(self):
+        """Toggle per-block ``use_checkpoint`` on every transformer flow model.
+
+        Trellis2 flow models do not expose a top-level
+        ``enable_gradient_checkpointing()`` method (which is what the base
+        class' implementation looks for); instead, each transformer block
+        has a ``use_checkpoint: bool`` attribute that routes its forward
+        through ``torch.utils.checkpoint.checkpoint(...)`` when True (see
+        ``third_party/TRELLIS.2/trellis2/modules/[sparse/]transformer``).
+
+        We mirror that here: iterate over ``self.transformer_names``
+        (target flow models) and flip ``block.use_checkpoint`` for every
+        block that has the attribute.  Rollout / eval call paths run under
+        ``torch.no_grad`` so the flag is a no-op there.
+        """
+        total = 0
+        for name in self.transformer_names:
+            component = getattr(self.pipeline, name, None)
+            if component is None or not hasattr(component, 'blocks'):
+                continue
+            n_enabled = 0
+            for block in component.blocks:
+                if hasattr(block, 'use_checkpoint'):
+                    block.use_checkpoint = True
+                    n_enabled += 1
+            logger.info(
+                f"Enabled gradient checkpointing for {name}: "
+                f"{n_enabled}/{len(component.blocks)} blocks"
+            )
+            total += n_enabled
+        if total == 0:
+            logger.warning(
+                "enable_gradient_checkpointing: no transformer blocks with "
+                f"`use_checkpoint` attribute on {self.transformer_names}."
+            )
+
     # ======================== Stage Scheduler Helpers ========================
 
     _STAGE_SCHEDULER_ATTR = {
@@ -442,6 +516,13 @@ class Trellis2Adapter(BaseAdapter):
         'shape': 'shape_slat_sampler_params',
         'tex':   'tex_slat_sampler_params',
     }
+
+    @staticmethod
+    def _as_scalar_resolution(resolution) -> int:
+        """Flow-Factory passes (H, W) tuples; Trellis2 expects a single int."""
+        if isinstance(resolution, (tuple, list)):
+            return int(resolution[0])
+        return int(resolution)
 
     def _get_stage_scheduler(self, stage: str):
         """Return the scheduler for the given stage."""
@@ -493,23 +574,20 @@ class Trellis2Adapter(BaseAdapter):
         neg_image_cond_512: Optional[List[torch.Tensor]] = None,
         image_cond_1024: Optional[List[torch.Tensor]] = None,
         neg_image_cond_1024: Optional[List[torch.Tensor]] = None,
-        image_cond: Optional[List[torch.Tensor]] = None,
-        neg_image_cond: Optional[List[torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple:
         """Resolve per-resolution conditioning tensors for the requested stages.
 
-        Handles legacy single-resolution aliases, on-the-fly encoding from
-        raw images, and zero-fill for missing negative conditioning.
+        Falls back to on-the-fly encoding from raw *images* when pre-encoded
+        tensors are missing.  Zero-fills negative conditioning when absent.
 
         Returns ``(cond_512, neg_512, cond_1024, neg_1024, condition_images, batch_size)``.
         """
         needs_512  = 'dense' in stages
         needs_1024 = bool({'shape', 'tex'} & set(stages))
 
-        cond_512  = image_cond_512  or (image_cond     if not needs_1024 else None)
-        neg_512   = neg_image_cond_512 or (neg_image_cond if not needs_1024 else None)
-        cond_1024 = image_cond_1024 or (image_cond     if not needs_512  else None)
-        neg_1024  = neg_image_cond_1024 or (neg_image_cond if not needs_512  else None)
+        cond_512, neg_512   = image_cond_512, neg_image_cond_512
+        cond_1024, neg_1024 = image_cond_1024, neg_image_cond_1024
 
         if (needs_512 and cond_512 is None) or (needs_1024 and cond_1024 is None):
             if images is None:
@@ -518,13 +596,13 @@ class Trellis2Adapter(BaseAdapter):
                     "image_cond_1024 (from preprocess_func) or raw images."
                 )
             encoded = self.preprocess_func(images=images)
-            cond_512  = cond_512  or encoded.get('image_cond_512')
-            neg_512   = neg_512   or encoded.get('neg_image_cond_512')
-            cond_1024 = cond_1024 or encoded.get('image_cond_1024')
-            neg_1024  = neg_1024  or encoded.get('neg_image_cond_1024')
-            condition_images = condition_images or encoded.get('condition_images')
+            cond_512  = cond_512  if cond_512  is not None else encoded.get('image_cond_512')
+            neg_512   = neg_512   if neg_512   is not None else encoded.get('neg_image_cond_512')
+            cond_1024 = cond_1024 if cond_1024 is not None else encoded.get('image_cond_1024')
+            neg_1024  = neg_1024  if neg_1024  is not None else encoded.get('neg_image_cond_1024')
+            condition_images = condition_images if condition_images is not None else encoded.get('condition_images')
 
-        ref_cond = cond_1024 or cond_512
+        ref_cond = cond_1024 if cond_1024 is not None else cond_512
         if ref_cond is None:
             raise ValueError("No conditioning tensors available.")
         batch_size = len(ref_cond)
@@ -540,15 +618,20 @@ class Trellis2Adapter(BaseAdapter):
         self,
         log_prob: torch.Tensor,         # (N_total,) per-point log-prob
         sparse_coords: torch.Tensor,    # (N_total, 4), col 0 = batch index
+        batch_size: int,                # explicit B; do not infer from coords max
     ) -> torch.Tensor:                  # (B,)
-        """Reduce per-point log_prob to per-sample via mean aggregation."""
-        B = int(sparse_coords[:, 0].max().item()) + 1
-        batch_idx = sparse_coords[:, 0].long()                               # (N_total,)
-        point_sum = torch.zeros(B, device=log_prob.device, dtype=log_prob.dtype)  # (B,)
-        point_cnt = torch.zeros(B, device=log_prob.device, dtype=log_prob.dtype)  # (B,)
-        point_sum.scatter_add_(0, batch_idx, log_prob)                        # (B,)
-        point_cnt.scatter_add_(0, batch_idx, torch.ones_like(log_prob))       # (B,)
-        return point_sum / point_cnt.clamp_min(1.0)                           # (B,)
+        """Reduce per-point log_prob to per-sample via mean aggregation.
+
+        ``batch_size`` is passed in explicitly so that samples with zero points
+        (or a trailing batch index absent from ``coords``) still produce a
+        length-``B`` output vector.
+        """
+        batch_idx = sparse_coords[:, 0].long()                                             # (N_total,)
+        point_sum = torch.zeros(batch_size, device=log_prob.device, dtype=log_prob.dtype)  # (B,)
+        point_cnt = torch.zeros(batch_size, device=log_prob.device, dtype=log_prob.dtype)  # (B,)
+        point_sum.scatter_add_(0, batch_idx, log_prob)                                     # (B,)
+        point_cnt.scatter_add_(0, batch_idx, torch.ones_like(log_prob))                    # (B,)
+        return point_sum / point_cnt.clamp_min(1.0)                                        # (B,)
 
     # ======================== Mode Sync ========================
 
@@ -596,7 +679,7 @@ class Trellis2Adapter(BaseAdapter):
                 continue
             else:
                 pipeline_dict = self.pipeline.__dict__
-                if comp in pipeline_dict and isinstance(pipeline_dict[comp], nn.Module):
+                if comp in pipeline_dict and (isinstance(pipeline_dict[comp], nn.Module) or hasattr(pipeline_dict[comp], 'to')):
                     resolved.append(comp)
         
         return list(dict.fromkeys(resolved))
@@ -673,19 +756,24 @@ class Trellis2Adapter(BaseAdapter):
     def inference_modules(self) -> List[str]:
         """
         Modules needed during training loop.
-        The transformer (target flow model), decoders, and image encoder.
-        
-        Only the decoder(s) relevant to the active target stage are included
-        to avoid occupying VRAM with unused models.
+
+        Reward computation requires rendering multi-view RGB, which needs
+        the full dense -> shape -> tex -> decode pipeline.  Therefore both
+        decoders and all upstream transformers are always loaded.
         """
         target = self.pipeline._target_flow_model  # e.g. 'shape_slat_1024'
-        stage = target.split('_')[0]  # 'shape', 'tex', or 'dense'
-        decoders = {
-            'shape': ['shape_decoder'],
-            'tex':   ['shape_decoder', 'tex_decoder'],  # tex decode needs shape subs
-            'dense': [],
-        }.get(stage, ['shape_decoder', 'tex_decoder'])
-        return ['transformer', 'image_encoder'] + decoders
+        stage = target.split('_')[0]               # 'shape', 'tex', or 'dense'
+        res_suffix = target.split('_')[-1]         # '1024' or '512'
+
+        decoders = ['shape_decoder', 'tex_decoder']
+        upstream = ['sparse_structure_flow_model', 'sparse_structure_decoder']
+
+        if stage != 'shape':
+            upstream.append(f'transformer_shape_{res_suffix}')
+        if stage != 'tex':
+            upstream.append(f'transformer_tex_{res_suffix}')
+
+        return ['transformer', 'image_encoder'] + upstream + decoders
     
     # ======================== Encoding Methods ========================
 
@@ -894,6 +982,11 @@ class Trellis2Adapter(BaseAdapter):
 
         return {'x_t': x_t, 'next_latents': next_latents_st, 'concat_cond': concat_cond}
 
+    @property
+    def _training_stage(self) -> str:
+        """Derive the training stage from pipeline config."""
+        return self.pipeline._target_flow_model.split('_')[0]
+
     def forward(
         self,
         t: torch.Tensor,
@@ -918,7 +1011,26 @@ class Trellis2Adapter(BaseAdapter):
         ``latents`` may be a plain tensor (from Trainer batch) or a
         SparseTensor (from inference loops).  ``_build_sparse_inputs``
         handles both cases idempotently.
+
+        ``t`` / ``t_next`` may arrive as a 0-d tensor (adapter-internal
+        callers) or as a ``(B,)`` tensor (Trainer-style, e.g. GRPO passes
+        ``batch['timesteps'][:, step_idx]``).  Same-t-across-batch is the
+        standard diffusion training assumption also used by Wan / Z-Image
+        adapters, so we just take element 0.
+
+        When ``stage`` is None (the typical optimize path where batch
+        dict has no ``stage`` key), it is derived from
+        ``pipeline._target_flow_model`` so the correct flow model is
+        always selected.
         """
+        if stage is None:
+            stage = self._training_stage
+        if t.ndim == 1:
+            assert t.eq(t[0]).all(), "Trellis2 requires all samples to share the same timestep."
+            t = t[0]                                                          # 0-d tensor
+        if t_next is not None and t_next.ndim == 1:
+            assert t_next.eq(t_next[0]).all(), "Trellis2 requires all samples to share the same t_next."
+            t_next = t_next[0]                                                # 0-d tensor
         t_val = float(t.item())
         t_next_val = float(t_next.item()) if t_next is not None else 0.0
         apply_cfg = (guidance_interval[0] <= t_val <= guidance_interval[1]
@@ -929,7 +1041,7 @@ class Trellis2Adapter(BaseAdapter):
             sigma_min = scheduler._sigma_min
             pred_pos = self._forward_dense(t_val, latents, image_cond)
             if apply_cfg:
-                pred_neg = self._forward_dense(t_val, latents, neg_image_cond)
+                pred_neg = self._forward_dense(t_val, latents, neg_image_cond, bypass_ddp=True)
                 pred_v = self._apply_cfg_dense(
                     pred_pos.float(), pred_neg.float(), latents.float(),
                     t_val, guidance_scale, guidance_rescale, sigma_min,
@@ -943,28 +1055,31 @@ class Trellis2Adapter(BaseAdapter):
                 noise_level=noise_level, compute_log_prob=compute_log_prob,
             )
 
-        elif stage in ('shape', 'tex', None):
-            effective_stage = stage or 'shape'
-            scheduler = self._get_stage_scheduler(effective_stage)
+        elif stage in ('shape', 'tex'):
+            scheduler = self._get_stage_scheduler(stage)
             sigma_min = scheduler._sigma_min
+            effective_concat_cond = tex_concat_cond if stage == 'tex' else None
             sparse = self._build_sparse_inputs(
-                latents, sparse_coords, effective_stage, stage_resolution,
-                next_latents=next_latents, tex_concat_cond=tex_concat_cond,
+                latents, sparse_coords, stage, stage_resolution,
+                next_latents=next_latents, tex_concat_cond=effective_concat_cond,
             )
             x_t = sparse['x_t']
             concat_cond = sparse['concat_cond']
+            B_forward = int(x_t.coords[:, 0].max().item()) + 1                   # scalar int
 
             pred_pos = self._forward_sparse(
                 t_val, x_t, image_cond, concat_cond=concat_cond,
-                stage=effective_stage, stage_resolution=stage_resolution,
+                stage=stage, stage_resolution=stage_resolution,
             )
             if apply_cfg:
                 pred_neg = self._forward_sparse(
                     t_val, x_t, neg_image_cond, concat_cond=concat_cond,
-                    stage=effective_stage, stage_resolution=stage_resolution,
+                    stage=stage, stage_resolution=stage_resolution,
+                    bypass_ddp=True,
                 )
                 pred_v = self._apply_cfg_sparse(
                     pred_pos, pred_neg, x_t, t_val, guidance_scale, guidance_rescale, sigma_min,
+                    batch_size=B_forward,
                 )
             else:
                 pred_v = pred_pos
@@ -975,7 +1090,9 @@ class Trellis2Adapter(BaseAdapter):
                 noise_level=noise_level, compute_log_prob=compute_log_prob,
             )
             if output.log_prob is not None:
-                output.log_prob = self._reduce_sparse_log_prob(output.log_prob, x_t.coords)
+                output.log_prob = self._reduce_sparse_log_prob(
+                    output.log_prob, x_t.coords, batch_size=B_forward,
+                )
             return output
 
         else:
@@ -983,7 +1100,10 @@ class Trellis2Adapter(BaseAdapter):
     
     # ---------------------- Dense path ----------------------
 
-    def _forward_dense(self, t: float, latents: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def _forward_dense(
+        self, t: float, latents: torch.Tensor, cond: torch.Tensor,
+        bypass_ddp: bool = False,
+    ) -> torch.Tensor:
         """Pure model forward for dense stage. Returns ``pred_v`` tensor.
 
         No autocast — the model's own ``manual_cast`` handles dtype
@@ -991,7 +1111,10 @@ class Trellis2Adapter(BaseAdapter):
         Inputs should be float32 (matching official pipeline behavior).
         """
         device = self.device
-        flow_model = self.pipeline.get_flow_model('dense')
+        if 'dense' == self._training_stage:
+            flow_model = self._unwrap(self.transformer) if bypass_ddp else self.transformer
+        else:
+            flow_model = self.pipeline.get_flow_model('dense')
 
         latents = latents.to(device=device, dtype=torch.float32)
         cond = cond.to(device=device, dtype=torch.float32)
@@ -1042,26 +1165,45 @@ class Trellis2Adapter(BaseAdapter):
         guidance_scale: float,
         guidance_rescale: float,
         sigma_min: float,
+        batch_size: int,
     ) -> 'SparseTensor':
         """CFG blend + optional rescale for sparse stages. Returns ``pred_v`` SparseTensor.
 
-        Aligned with ``trellis2_cfg_sparse`` in reference rollout/base.py.
-        std is computed as a scalar over all N*C elements (per-sample std,
-        equivalent to official ``x_0.std(dim=list(range(1, ndim)))`` for B=1).
+        Aligned with official ``classifier_free_guidance_mixin._inference_model``:
+        the rescale ratio is a per-sample std over all (N_b * C) elements of that
+        sample (equivalent to ``x_0.std(dim=list(range(1, ndim)))`` for dense).
+
+        ``batch_size`` is passed explicitly; empty samples (no coords) still get
+        a ratio slot of 1.0 so broadcasting stays length-correct.
         """
         pred_v = guidance_scale * pred_pos + (1.0 - guidance_scale) * pred_neg  # SparseTensor
 
         if guidance_rescale > 0:
             alpha = 1.0 - sigma_min
             beta  = sigma_min + alpha * t_val
-            x_0_pos = alpha * x_t - beta * pred_pos   # SparseTensor
-            x_0_cfg = alpha * x_t - beta * pred_v     # SparseTensor
-            std_pos = x_0_pos.feats.std()              # scalar — per-sample std over all N*C
-            std_cfg = x_0_cfg.feats.std()              # scalar
-            ratio = std_pos / (std_cfg + 1e-8)         # scalar
-            x_0_rescaled = x_0_cfg.replace(feats=x_0_cfg.feats * ratio)
+            x_0_pos = alpha * x_t - beta * pred_pos                              # SparseTensor
+            x_0_cfg = alpha * x_t - beta * pred_v                                # SparseTensor
+
+            feats_pos_f32 = x_0_pos.feats.float()                                # (N_total, C) fp32
+            feats_cfg_f32 = x_0_cfg.feats.float()                                # (N_total, C) fp32
+            batch_idx = x_0_pos.coords[:, 0].long()                              # (N_total,)
+
+            ratio = torch.ones(
+                batch_size, device=feats_pos_f32.device, dtype=torch.float32
+            )                                                                    # (B,) fp32
+            for b in range(batch_size):
+                mask_b = batch_idx == b                                          # (N_total,)
+                if mask_b.any():
+                    std_pos_b = feats_pos_f32[mask_b].std()                      # scalar fp32
+                    std_cfg_b = feats_cfg_f32[mask_b].std()                      # scalar fp32
+                    ratio[b] = std_pos_b / (std_cfg_b + 1e-8)                    # scalar
+
+            ratio_per_point = ratio[batch_idx].unsqueeze(-1).to(
+                x_0_cfg.feats.dtype
+            )                                                                    # (N_total, 1)
+            x_0_rescaled = x_0_cfg.replace(feats=x_0_cfg.feats * ratio_per_point)
             x_0 = guidance_rescale * x_0_rescaled + (1.0 - guidance_rescale) * x_0_cfg
-            pred_v = (alpha * x_t - x_0) / beta       # SparseTensor
+            pred_v = (alpha * x_t - x_0) / beta                                  # SparseTensor
         return pred_v
 
     # ---------------------- Shape / Tex path ----------------------
@@ -1074,15 +1216,19 @@ class Trellis2Adapter(BaseAdapter):
         concat_cond: Optional['SparseTensor'] = None,
         stage: str = 'shape',
         stage_resolution: int = 1024,
+        bypass_ddp: bool = False,
     ) -> 'SparseTensor':
         """Pure model forward for sparse stage. Returns ``pred_v`` SparseTensor.
 
         No CFG, no scheduler step — the caller handles both.
         """
         device = self.device
-        flow_model = self.pipeline.get_flow_model(stage, stage_resolution)
+        if stage == self._training_stage:
+            flow_model = self._unwrap(self.transformer) if bypass_ddp else self.transformer
+        else:
+            flow_model = self.pipeline.get_flow_model(stage, stage_resolution)
 
-        cond = cond.to(dtype=torch.float32)
+        cond = cond.to(device=device, dtype=torch.float32)
         t_tensor = torch.full((x_t.shape[0],), 1000 * t, device=device, dtype=torch.float32)  # (B,)
 
         pred_v = flow_model(x=x_t, t=t_tensor, cond=cond, concat_cond=concat_cond)
@@ -1101,9 +1247,6 @@ class Trellis2Adapter(BaseAdapter):
         neg_image_cond_512: Optional[List[torch.Tensor]] = None,
         image_cond_1024: Optional[List[torch.Tensor]] = None,
         neg_image_cond_1024: Optional[List[torch.Tensor]] = None,
-        # Backward-compat single-resolution cond aliases
-        image_cond: Optional[List[torch.Tensor]] = None,
-        neg_image_cond: Optional[List[torch.Tensor]] = None,
         condition_images: Optional[List[List[Image.Image]]] = None,
         # Stage(s) selection — single string or ordered list for multi-stage
         stages: Union[str, List[str], None] = None,
@@ -1154,7 +1297,6 @@ class Trellis2Adapter(BaseAdapter):
             image_cond_512 / neg_image_cond_512: Pre-encoded 512 px cond (dense stage).
             image_cond_1024 / neg_image_cond_1024: Pre-encoded 1024 px cond
                 (shape / tex stages).
-            image_cond / neg_image_cond: Legacy single-resolution cond (backward compat).
             stages: Stage(s) to run in order, e.g. ``'shape'``,
                 ``['dense', 'shape', 'tex']``.  ``None`` infers from
                 ``pipeline._target_flow_model``.
@@ -1170,6 +1312,7 @@ class Trellis2Adapter(BaseAdapter):
             ``List[Trellis2Sample]`` — one element per conditioning input.
         """
         sampler_params = sampler_params or {}
+        resolution = self._as_scalar_resolution(resolution)
 
         # ── 1. Normalise stage list ────────────────────────────────────────────
         if stages is None:
@@ -1196,14 +1339,14 @@ class Trellis2Adapter(BaseAdapter):
                 stages_list, images=images, condition_images=condition_images,
                 image_cond_512=image_cond_512, neg_image_cond_512=neg_image_cond_512,
                 image_cond_1024=image_cond_1024, neg_image_cond_1024=neg_image_cond_1024,
-                image_cond=image_cond, neg_image_cond=neg_image_cond,
             )
 
         # ── 3. Initialise sample stubs ─────────────────────────────────────────
         samples = [
             Trellis2Sample(
-                condition_images=condition_images[b] if condition_images else None,
+                condition_images=condition_images[b] if condition_images is not None else None,
                 resolution=resolution,
+                prompt=prompt[b] if prompt else None,
             )
             for b in range(batch_size)
         ]
@@ -1290,8 +1433,272 @@ class Trellis2Adapter(BaseAdapter):
 
         return samples
 
+    @torch.no_grad()
+    def inference_with_shared_dense(
+        self,
+        prompt: Optional[List[str]] = None,
+        images: Optional[MultiImageBatch] = None,
+        image_cond_512: Optional[List[torch.Tensor]] = None,
+        neg_image_cond_512: Optional[List[torch.Tensor]] = None,
+        image_cond_1024: Optional[List[torch.Tensor]] = None,
+        neg_image_cond_1024: Optional[List[torch.Tensor]] = None,
+        condition_images: Optional[List[List[Image.Image]]] = None,
+        resolution: int = 1024,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        guidance_interval: Tuple[float, float] = (0.0, 1.0),
+        guidance_rescale: float = 0.0,
+        generator: Optional[torch.Generator] = None,
+        compute_log_prob: bool = True,
+        trajectory_indices: TrajectoryIndicesType = 'all',
+        extra_call_back_kwargs: List[str] = [],
+        sampler_params: Dict = None,
+        decode_output: bool = False,
+        render_num_frames: int = 24,
+        render_resolution: int = 512,
+        envmap_path: Optional[str] = None,
+        **kwargs,
+    ) -> List[Trellis2Sample]:
+        """Train shape with shared dense: dense B=1 (pilot), shape+tex B=K.
 
-    # ======================== Per-Stage Inference Workers ========================
+        Runs the dense stage once on a single pilot sample, then copies its
+        outputs (``sparse_coords``, ``dense_*``) to all K samples before
+        running shape (training stage) and tex (downstream for reward) on
+        all K samples independently.
+        """
+        sampler_params = sampler_params or {}
+        resolution = self._as_scalar_resolution(resolution)
+
+        stages_list = ['dense', 'shape', 'tex']
+        cond_512, neg_512, cond_1024, neg_1024, condition_images, batch_size = \
+            self._resolve_conditioning(
+                stages_list, images=images, condition_images=condition_images,
+                image_cond_512=image_cond_512, neg_image_cond_512=neg_image_cond_512,
+                image_cond_1024=image_cond_1024, neg_image_cond_1024=neg_image_cond_1024,
+            )
+
+        ss_resolution = 32 if resolution <= 512 else 64
+        g_dense = self._get_stage_guidance(
+            'dense', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
+        )
+
+        pilot = [Trellis2Sample(
+            condition_images=condition_images[0] if condition_images is not None else None,
+            resolution=resolution,
+        )]
+        self._inference_dense(
+            samples=pilot,
+            image_cond=[cond_512[0]],
+            neg_image_cond=[neg_512[0]],
+            num_inference_steps=num_inference_steps,
+            guidance_scale=g_dense['guidance_scale'],
+            guidance_interval=g_dense['guidance_interval'],
+            guidance_rescale=g_dense['guidance_rescale'],
+            generator=generator,
+            trajectory_indices=trajectory_indices,
+            extra_call_back_kwargs=extra_call_back_kwargs,
+            ss_resolution=ss_resolution,
+            is_training_stage=False,
+            compute_log_prob=False,
+        )
+
+        samples = [
+            Trellis2Sample(
+                condition_images=condition_images[b] if condition_images is not None else None,
+                resolution=resolution,
+                prompt=prompt[b] if prompt else None,
+            )
+            for b in range(batch_size)
+        ]
+        for s in samples:
+            s.sparse_coords = pilot[0].sparse_coords
+            s.dense_final_latent = pilot[0].dense_final_latent
+            s.dense_all_latents = pilot[0].dense_all_latents
+            s.dense_log_probs = pilot[0].dense_log_probs
+            s.dense_image_cond = pilot[0].dense_image_cond
+            s.dense_neg_image_cond = pilot[0].dense_neg_image_cond
+
+        g_shape = self._get_stage_guidance(
+            'shape', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
+        )
+        self._inference_shape(
+            samples=samples,
+            image_cond=cond_1024,
+            neg_image_cond=neg_1024,
+            resolution=resolution,
+            guidance_scale=g_shape['guidance_scale'],
+            guidance_interval=g_shape['guidance_interval'],
+            guidance_rescale=g_shape['guidance_rescale'],
+            generator=generator,
+            trajectory_indices=trajectory_indices,
+            extra_call_back_kwargs=extra_call_back_kwargs,
+            is_training_stage=True,
+            compute_log_prob=compute_log_prob,
+        )
+
+        g_tex = self._get_stage_guidance(
+            'tex', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
+        )
+        self._inference_tex(
+            samples=samples,
+            image_cond=cond_1024,
+            neg_image_cond=neg_1024,
+            resolution=resolution,
+            guidance_scale=g_tex['guidance_scale'],
+            guidance_interval=g_tex['guidance_interval'],
+            guidance_rescale=g_tex['guidance_rescale'],
+            generator=generator,
+            trajectory_indices=trajectory_indices,
+            extra_call_back_kwargs=extra_call_back_kwargs,
+            is_training_stage=False,
+            compute_log_prob=False,
+        )
+
+        if decode_output:
+            envmap = self._build_envmap(envmap_path)
+            samples = [
+                self.render_latents(s, num_frames=render_num_frames,
+                                    resolution=render_resolution, envmap=envmap)
+                for s in samples
+            ]
+
+        return samples
+
+    @torch.no_grad()
+    def inference_with_shared_dense_shape(
+        self,
+        prompt: Optional[List[str]] = None,
+        images: Optional[MultiImageBatch] = None,
+        image_cond_512: Optional[List[torch.Tensor]] = None,
+        neg_image_cond_512: Optional[List[torch.Tensor]] = None,
+        image_cond_1024: Optional[List[torch.Tensor]] = None,
+        neg_image_cond_1024: Optional[List[torch.Tensor]] = None,
+        condition_images: Optional[List[List[Image.Image]]] = None,
+        resolution: int = 1024,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        guidance_interval: Tuple[float, float] = (0.0, 1.0),
+        guidance_rescale: float = 0.0,
+        generator: Optional[torch.Generator] = None,
+        compute_log_prob: bool = True,
+        trajectory_indices: TrajectoryIndicesType = 'all',
+        extra_call_back_kwargs: List[str] = [],
+        sampler_params: Dict = None,
+        decode_output: bool = False,
+        render_num_frames: int = 24,
+        render_resolution: int = 512,
+        envmap_path: Optional[str] = None,
+        **kwargs,
+    ) -> List[Trellis2Sample]:
+        """Train tex with shared dense+shape: dense+shape B=1 (pilot), tex B=K.
+
+        Runs dense and shape stages once on a single pilot sample, then
+        copies all upstream outputs to K samples before running tex
+        (training stage) on all K samples independently.
+        """
+        sampler_params = sampler_params or {}
+        resolution = self._as_scalar_resolution(resolution)
+
+        stages_list = ['dense', 'shape', 'tex']
+        cond_512, neg_512, cond_1024, neg_1024, condition_images, batch_size = \
+            self._resolve_conditioning(
+                stages_list, images=images, condition_images=condition_images,
+                image_cond_512=image_cond_512, neg_image_cond_512=neg_image_cond_512,
+                image_cond_1024=image_cond_1024, neg_image_cond_1024=neg_image_cond_1024,
+            )
+
+        ss_resolution = 32 if resolution <= 512 else 64
+
+        pilot = [Trellis2Sample(
+            condition_images=condition_images[0] if condition_images is not None else None,
+            resolution=resolution,
+        )]
+
+        g_dense = self._get_stage_guidance(
+            'dense', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
+        )
+        self._inference_dense(
+            samples=pilot,
+            image_cond=[cond_512[0]],
+            neg_image_cond=[neg_512[0]],
+            num_inference_steps=num_inference_steps,
+            guidance_scale=g_dense['guidance_scale'],
+            guidance_interval=g_dense['guidance_interval'],
+            guidance_rescale=g_dense['guidance_rescale'],
+            generator=generator,
+            trajectory_indices=trajectory_indices,
+            extra_call_back_kwargs=extra_call_back_kwargs,
+            ss_resolution=ss_resolution,
+            is_training_stage=False,
+            compute_log_prob=False,
+        )
+
+        g_shape = self._get_stage_guidance(
+            'shape', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
+        )
+        self._inference_shape(
+            samples=pilot,
+            image_cond=[cond_1024[0]],
+            neg_image_cond=[neg_1024[0]],
+            resolution=resolution,
+            guidance_scale=g_shape['guidance_scale'],
+            guidance_interval=g_shape['guidance_interval'],
+            guidance_rescale=g_shape['guidance_rescale'],
+            generator=generator,
+            trajectory_indices=trajectory_indices,
+            extra_call_back_kwargs=extra_call_back_kwargs,
+            is_training_stage=False,
+            compute_log_prob=False,
+        )
+
+        samples = [
+            Trellis2Sample(
+                condition_images=condition_images[b] if condition_images is not None else None,
+                resolution=resolution,
+                prompt=prompt[b] if prompt else None,
+            )
+            for b in range(batch_size)
+        ]
+        for s in samples:
+            s.sparse_coords = pilot[0].sparse_coords
+            s.dense_final_latent = pilot[0].dense_final_latent
+            s.dense_all_latents = pilot[0].dense_all_latents
+            s.dense_log_probs = pilot[0].dense_log_probs
+            s.dense_image_cond = pilot[0].dense_image_cond
+            s.dense_neg_image_cond = pilot[0].dense_neg_image_cond
+            s.shape_final_latent = pilot[0].shape_final_latent
+            s.shape_all_latents = pilot[0].shape_all_latents
+            s.shape_log_probs = pilot[0].shape_log_probs
+            s.shape_image_cond = pilot[0].shape_image_cond
+            s.shape_neg_image_cond = pilot[0].shape_neg_image_cond
+
+        g_tex = self._get_stage_guidance(
+            'tex', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
+        )
+        self._inference_tex(
+            samples=samples,
+            image_cond=cond_1024,
+            neg_image_cond=neg_1024,
+            resolution=resolution,
+            guidance_scale=g_tex['guidance_scale'],
+            guidance_interval=g_tex['guidance_interval'],
+            guidance_rescale=g_tex['guidance_rescale'],
+            generator=generator,
+            trajectory_indices=trajectory_indices,
+            extra_call_back_kwargs=extra_call_back_kwargs,
+            is_training_stage=True,
+            compute_log_prob=compute_log_prob,
+        )
+
+        if decode_output:
+            envmap = self._build_envmap(envmap_path)
+            samples = [
+                self.render_latents(s, num_frames=render_num_frames,
+                                    resolution=render_resolution, envmap=envmap)
+                for s in samples
+            ]
+
+        return samples
 
     def _decode_dense_to_coords(
         self,
@@ -1329,10 +1736,6 @@ class Trellis2Adapter(BaseAdapter):
             coords_b = all_coords[all_coords[:, 0] == b].clone().contiguous()  # (N_b, 4)
             N_b = coords_b.shape[0]
             if max_num_coords > 0 and N_b > max_num_coords:
-                logger.info(
-                    f"[dense] sample {b}: {N_b} coords exceeds "
-                    f"max_num_coords={max_num_coords}, subsampling"
-                )
                 perm = torch.randperm(N_b, device=coords_b.device)[:max_num_coords]  # (max_num_coords,)
                 coords_b = coords_b[perm]                                             # (max_num_coords, 4)
             result.append(coords_b)
@@ -1366,13 +1769,16 @@ class Trellis2Adapter(BaseAdapter):
         flow_model = self.pipeline.get_flow_model('dense')
         model_dtype = next(self._unwrap(flow_model).parameters()).dtype
 
-        cond_batched = torch.stack(image_cond).to(device=device)  # (B, seq, D)
-        neg_batched  = torch.stack(neg_image_cond).to(device=device)
+        cond_batched = (image_cond if isinstance(image_cond, torch.Tensor)
+                        else torch.stack(image_cond)).to(device=device)      # (B, seq, D)
+        neg_batched  = (neg_image_cond if isinstance(neg_image_cond, torch.Tensor)
+                        else torch.stack(neg_image_cond)).to(device=device)
 
         reso = flow_model.resolution
         in_channels = flow_model.in_channels
+        gen = generator[0] if isinstance(generator, list) else generator
         noise = torch.randn(
-            B, in_channels, reso, reso, reso, generator=generator
+            B, in_channels, reso, reso, reso, generator=gen
         ).to(device)                                                  # (B, C, D, H, W)
 
         scheduler = self._get_stage_scheduler('dense')
@@ -1433,13 +1839,6 @@ class Trellis2Adapter(BaseAdapter):
 
         coords_list = self._decode_dense_to_coords(current, ss_resolution)
 
-        logger.info(
-            f"[dense] final latent stats: mean={current.mean().item():.4f}, "
-            f"std={current.std().item():.4f}, shape={tuple(current.shape)}"
-        )
-        for b_idx, c in enumerate(coords_list):
-            logger.info(f"[dense] sample {b_idx}: {c.shape[0]} coords")
-
         for b, sample in enumerate(samples):
             dense_latents_b = (
                 torch.stack([lat[0][b] for lat in all_latents], dim=0)
@@ -1452,19 +1851,17 @@ class Trellis2Adapter(BaseAdapter):
             coords_b = coords_list[b]
             coords_b[:, 0] = 0
 
-            sample.sparse_coords        = coords_b
-            sample.dense_all_latents    = dense_latents_b
-            sample.dense_log_probs      = dense_log_probs_b
-            sample.dense_image_cond     = image_cond[b]
-            sample.dense_neg_image_cond = neg_image_cond[b]
+            sample.sparse_coords             = coords_b
+            sample.dense_final_latent        = current[b]
+            sample.dense_all_latents         = dense_latents_b
+            sample.dense_log_probs           = dense_log_probs_b
+            sample.dense_image_cond          = image_cond[b]
+            sample.dense_neg_image_cond      = neg_image_cond[b]
+            sample.dense_latent_index_map    = latent_index_map
+            sample.dense_log_prob_index_map  = log_prob_index_map
+            sample.dense_timesteps           = timesteps
             if is_training_stage:
-                sample.all_latents        = dense_latents_b
-                sample.latent_index_map   = latent_index_map
-                sample.log_probs          = dense_log_probs_b
-                sample.log_prob_index_map = log_prob_index_map
-                sample.image_cond         = image_cond[b]
-                sample.neg_image_cond     = neg_image_cond[b]
-                sample.timesteps          = timesteps
+                sample.activate_stage('dense')
                 sample.extra_kwargs = {
                     **{k: (v[b] if isinstance(v, (list, torch.Tensor)) else v)
                        for k, v in extra_callback_res.items()},
@@ -1507,7 +1904,8 @@ class Trellis2Adapter(BaseAdapter):
                 )
             coords = sample.sparse_coords.to(device)
             N_b    = coords.shape[0]
-            noise  = torch.randn(N_b, in_channels, generator=generator).to(device)  # (N_b, C)
+            gen_b = generator[b] if isinstance(generator, list) else generator
+            noise  = torch.randn(N_b, in_channels, generator=gen_b).to(device)  # (N_b, C)
 
             SparseTensor = self._SparseTensor
             x_t = SparseTensor(
@@ -1542,18 +1940,21 @@ class Trellis2Adapter(BaseAdapter):
                     pred_neg = self._forward_sparse(t_val, x_t, neg_cond, stage='shape', stage_resolution=resolution)
                     pred_v = self._apply_cfg_sparse(
                         pred_pos, pred_neg, x_t, t_val, guidance_scale, guidance_rescale, sigma_min,
+                        batch_size=1,
                     )
                 else:
                     pred_v = pred_pos
 
                 output = scheduler.step(
                     pred_v, t_val, t_next_val, x_t,
-                    generator=generator,
+                    generator=gen_b,
                     noise_level=noise_level_i,
                     compute_log_prob=step_compute_lp,
                 )
                 if output.log_prob is not None:
-                    output.log_prob = self._reduce_sparse_log_prob(output.log_prob, x_t.coords)
+                    output.log_prob = self._reduce_sparse_log_prob(
+                        output.log_prob, x_t.coords, batch_size=1,
+                    )
 
                 x_t = output.next_latents                                     # SparseTensor
                 latent_collector.collect(x_t.feats.unsqueeze(0), step_idx + 1) # (1, N_b, C)
@@ -1577,18 +1978,16 @@ class Trellis2Adapter(BaseAdapter):
                 if all_log_probs else None
             )                                                        # (T_log,)
 
-            sample.shape_all_latents    = shape_latents
-            sample.shape_log_probs      = shape_log_probs
-            sample.shape_image_cond     = image_cond[b]
-            sample.shape_neg_image_cond = neg_image_cond[b]
+            sample.shape_final_latent        = x_t.feats
+            sample.shape_all_latents         = shape_latents
+            sample.shape_log_probs           = shape_log_probs
+            sample.shape_image_cond          = image_cond[b]
+            sample.shape_neg_image_cond      = neg_image_cond[b]
+            sample.shape_latent_index_map    = latent_index_map
+            sample.shape_log_prob_index_map  = log_prob_index_map
+            sample.shape_timesteps           = timesteps
             if is_training_stage:
-                sample.all_latents        = shape_latents
-                sample.latent_index_map   = latent_index_map
-                sample.log_probs          = shape_log_probs
-                sample.log_prob_index_map = log_prob_index_map
-                sample.image_cond         = image_cond[b]
-                sample.neg_image_cond     = neg_image_cond[b]
-                sample.timesteps          = timesteps
+                sample.activate_stage('shape')
                 sample.extra_kwargs = {
                     **{k: v for k, v in extra_callback_res.items()},
                     'callback_index_map': callback_index_map,
@@ -1624,14 +2023,14 @@ class Trellis2Adapter(BaseAdapter):
         for b, sample in enumerate(samples):
             if sample.sparse_coords is None:
                 raise ValueError(f"sample[{b}].sparse_coords is None.")
-            if sample.shape_all_latents is None:
+            if sample.shape_final_latent is None:
                 raise ValueError(
-                    f"sample[{b}].shape_all_latents is None. Run shape stage first."
+                    f"sample[{b}].shape_final_latent is None. Run shape stage first."
                 )
             coords = sample.sparse_coords.to(device)
             N_b    = coords.shape[0]
 
-            tex_concat_cond = sample.shape_all_latents[-1].to(
+            tex_concat_cond = sample.shape_final_latent.to(
                 device=device, dtype=torch.float32
             )                                                          # (N_b, C_shape)
 
@@ -1641,7 +2040,8 @@ class Trellis2Adapter(BaseAdapter):
                     f"tex flow_model.in_channels ({flow_model.in_channels}) must exceed "
                     f"tex_concat_cond channels ({tex_concat_cond.shape[-1]})."
                 )
-            noise = torch.randn(N_b, noise_channels, generator=generator).to(device)  # (N_b, C_noise)
+            gen_b = generator[b] if isinstance(generator, list) else generator
+            noise = torch.randn(N_b, noise_channels, generator=gen_b).to(device)  # (N_b, C_noise)
 
             SparseTensor = self._SparseTensor
             x_t = SparseTensor(
@@ -1685,18 +2085,21 @@ class Trellis2Adapter(BaseAdapter):
                     )
                     pred_v = self._apply_cfg_sparse(
                         pred_pos, pred_neg, x_t, t_val, guidance_scale, guidance_rescale, sigma_min,
+                        batch_size=1,
                     )
                 else:
                     pred_v = pred_pos
 
                 output = scheduler.step(
                     pred_v, t_val, t_next_val, x_t,
-                    generator=generator,
+                    generator=gen_b,
                     noise_level=noise_level_i,
                     compute_log_prob=step_compute_lp,
                 )
                 if output.log_prob is not None:
-                    output.log_prob = self._reduce_sparse_log_prob(output.log_prob, x_t.coords)
+                    output.log_prob = self._reduce_sparse_log_prob(
+                        output.log_prob, x_t.coords, batch_size=1,
+                    )
 
                 x_t = output.next_latents                                     # SparseTensor
                 latent_collector.collect(x_t.feats.unsqueeze(0), step_idx + 1) # (1, N_b, C_noise)
@@ -1714,25 +2117,23 @@ class Trellis2Adapter(BaseAdapter):
             tex_latents = (
                 torch.stack([lat[0] for lat in all_latents], dim=0)
                 if all_latents else None
-            )                                                        # (T', N_b, C_noise)
+            )                                                        # (T', N_b, C_noise) or None
             tex_log_probs = (
                 torch.stack([lp[0][0] for lp in all_log_probs], dim=0)
                 if all_log_probs else None
-            )                                                        # (T_log,)
+            )                                                        # (T_log,) or None
 
-            sample.tex_all_latents    = tex_latents
-            sample.tex_log_probs      = tex_log_probs
-            sample.tex_image_cond     = image_cond[b]
-            sample.tex_neg_image_cond = neg_image_cond[b]
-            sample.tex_concat_cond    = tex_concat_cond
+            sample.tex_final_latent        = x_t.feats
+            sample.tex_all_latents         = tex_latents
+            sample.tex_log_probs           = tex_log_probs
+            sample.tex_image_cond          = image_cond[b]
+            sample.tex_neg_image_cond      = neg_image_cond[b]
+            sample.tex_concat_cond         = tex_concat_cond
+            sample.tex_latent_index_map    = latent_index_map
+            sample.tex_log_prob_index_map  = log_prob_index_map
+            sample.tex_timesteps           = timesteps
             if is_training_stage:
-                sample.all_latents        = tex_latents
-                sample.latent_index_map   = latent_index_map
-                sample.log_probs          = tex_log_probs
-                sample.log_prob_index_map = log_prob_index_map
-                sample.image_cond         = image_cond[b]
-                sample.neg_image_cond     = neg_image_cond[b]
-                sample.timesteps          = timesteps
+                sample.activate_stage('tex')
                 sample.extra_kwargs = {
                     **{k: v for k, v in extra_callback_res.items()},
                     'callback_index_map': callback_index_map,
@@ -1759,18 +2160,16 @@ class Trellis2Adapter(BaseAdapter):
             Denormalized features tensor, or None if stage data is absent.
         """
         if stage == 'dense':
-            stage_latents = sample.dense_all_latents
+            features = sample.dense_final_latent
         elif stage == 'shape':
-            stage_latents = sample.shape_all_latents
+            features = sample.shape_final_latent
         elif stage == 'tex':
-            stage_latents = sample.tex_all_latents
+            features = sample.tex_final_latent
         else:
             raise ValueError(f"Unknown stage: {stage!r}")
 
-        if stage_latents is None:
+        if features is None:
             return None
-        
-        features = stage_latents[-1]  # (N, C)
         
         # Denormalize
         device = features.device
@@ -1804,20 +2203,19 @@ class Trellis2Adapter(BaseAdapter):
         if coords is None:
             raise ValueError("No sparse_coords available for decoding")
         
+        decoder = self.pipeline.shape_decoder
+        decoder.eval()
+        decoder.set_resolution(sample.resolution)
+
         slat = SparseTensor(
-            feats=features.to(device),
+            feats=features.to(device=device, dtype=torch.float32),
             coords=coords.to(device),
         )
         
-        decoder = self.pipeline.shape_decoder
-        decoder.to(device)
-        decoder.eval()
-        decoder.set_resolution(sample.resolution)
-        
         from .chunked_mixin import ChunkedDecoderMixin
         ChunkedDecoderMixin.inject_to(decoder)
-        
-        with torch.no_grad():
+
+        with torch.no_grad(), torch.autocast('cuda', enabled=False):
             meshes, subs = decoder(slat, return_subs=True)
         
         mesh = meshes[0] if meshes else None
@@ -1853,15 +2251,17 @@ class Trellis2Adapter(BaseAdapter):
         SparseTensor = self._SparseTensor
         device = self.device
         
+        decoder = self.pipeline.tex_decoder
+        if decoder is None:
+            return None
+
         slat = SparseTensor(
-            feats=features.to(device),
+            feats=features.to(device=device, dtype=torch.float32),
             coords=coords.to(device),
         )
         
-        decoder = self.pipeline.tex_decoder
-        decoder.to(device)
-        
-        tex_voxels = decoder(slat, guide_subs=subs) * 0.5 + 0.5
+        with torch.autocast('cuda', enabled=False):
+            tex_voxels = decoder(slat, guide_subs=subs) * 0.5 + 0.5
         
         return tex_voxels
     
@@ -1950,6 +2350,7 @@ class Trellis2Adapter(BaseAdapter):
         return EnvMap(hdr_tensor)
 
     @torch.no_grad()
+    @torch.autocast('cuda', enabled=False)
     def render_latents(
         self,
         sample: Trellis2Sample,

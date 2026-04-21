@@ -694,6 +694,7 @@ class DPOTrainingArguments(TrainingArguments):
 _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     'grpo': GRPOTrainingArguments,
     'grpo-guard': GRPOTrainingArguments,
+    'trellis2_grpo': GRPOTrainingArguments,
     'nft': NFTTrainingArguments,
     'awm': AWMTrainingArguments,
     'dpo': DPOTrainingArguments,

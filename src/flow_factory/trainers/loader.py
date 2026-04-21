@@ -30,7 +30,7 @@ from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
 
-ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True) # Fix issue that Qwen-Image uses different cache context for CFG forwards
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
 def load_trainer(config: Arguments) -> BaseTrainer:
     """

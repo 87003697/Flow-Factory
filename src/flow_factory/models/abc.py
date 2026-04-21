@@ -1851,7 +1851,6 @@ class BaseAdapter(ABC):
         names = self._resolve_component_names(components)
         
         for name in names:
-            # Skip components that are managed by the accelerator
             if not self._should_manage_device(name):
                 continue
             component = self.get_component(name)

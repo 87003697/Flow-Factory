@@ -136,11 +136,12 @@ class BaseTrainer(ABC):
         eval_reward_configs = self.reward_loader.get_reward_configs('eval')
         # Initialize reward processor
         group_on_same_rank = self.config.data_args.sampler_type == "group_contiguous"
+        tokenizer = self.adapter.tokenizers[0] if self.adapter.tokenizers else None
         self.reward_processor = RewardProcessor(
             accelerator=self.accelerator,
             reward_models=self.reward_models,
             reward_configs=train_reward_configs,
-            tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding,
+            tokenizer=tokenizer,
             group_on_same_rank=group_on_same_rank,
             verbose=self.log_args.verbose,
         )
@@ -148,7 +149,7 @@ class BaseTrainer(ABC):
             accelerator=self.accelerator,
             reward_models=self.eval_reward_models,
             reward_configs=eval_reward_configs,
-            tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding
+            tokenizer=tokenizer,
             group_on_same_rank=group_on_same_rank,
             verbose=self.log_args.verbose,
         )
@@ -176,7 +177,7 @@ class BaseTrainer(ABC):
         return self.reward_models, self.eval_reward_models
 
     def _init_dataloader(self) -> Tuple[DataLoader, Union[None, DataLoader]]:
-        # Move text-encoder & vae to GPU for dataloader encoding
+        # Move preprocessing components to GPU for dataloader encoding
         self.adapter.on_load_components(
             components=self.adapter.preprocessing_modules,
             device=self.accelerator.device

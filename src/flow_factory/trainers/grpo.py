@@ -91,6 +91,10 @@ class GRPOTrainer(BaseTrainer):
             self.epoch += 1
 
     # =========================== Evaluation Loop ============================
+    def _extra_eval_inference_kwargs(self) -> dict:
+        """Subclass hook: extra kwargs injected into evaluate() inference calls."""
+        return {}
+
     def evaluate(self) -> None:
         """Evaluation loop."""
         if self.test_dataloader is None:
@@ -113,6 +117,7 @@ class GRPOTrainer(BaseTrainer):
                     'generator': generator,
                     'trajectory_indices': None, # No need to store trajectories during evaluation
                     **self.eval_args,
+                    **self._extra_eval_inference_kwargs(),
                 }
                 inference_kwargs.update(**batch)
                 inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)

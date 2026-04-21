@@ -70,7 +70,6 @@ class Trellis2PseudoPipeline:
             Options: 'shape_slat_1024', 'shape_slat_512', 'tex_slat_1024', 'tex_slat_512'
     """
     
-    # Models that must be loaded
     REQUIRED_MODELS = [
         'sparse_structure_flow_model',
         'sparse_structure_decoder',
@@ -80,7 +79,7 @@ class Trellis2PseudoPipeline:
         'tex_slat_decoder',
     ]
     
-    # Optional models
+    # 512-resolution variants are only needed for low-res training
     OPTIONAL_MODELS = [
         'shape_slat_flow_model_512',
         'tex_slat_flow_model_512',
@@ -88,10 +87,11 @@ class Trellis2PseudoPipeline:
     
     # Mapping from target name to model key
     TARGET_MODEL_MAP = {
+        'dense':           'sparse_structure_flow_model',
         'shape_slat_1024': 'shape_slat_flow_model_1024',
-        'shape_slat_512': 'shape_slat_flow_model_512',
-        'tex_slat_1024': 'tex_slat_flow_model_1024',
-        'tex_slat_512': 'tex_slat_flow_model_512',
+        'shape_slat_512':  'shape_slat_flow_model_512',
+        'tex_slat_1024':   'tex_slat_flow_model_1024',
+        'tex_slat_512':    'tex_slat_flow_model_512',
     }
     
     def __init__(
@@ -175,103 +175,85 @@ class Trellis2PseudoPipeline:
         self._target_flow_model = target_flow_model
         self._device = 'cpu'
     
+    @staticmethod
+    def _instantiate(module: Any, cfg: dict, path_override: Optional[str] = None) -> Any:
+        """Instantiate a component from a ``{name, args}`` config dict.
+
+        Args:
+            module: The module to look up the class from (e.g. ``samplers``).
+            cfg: Config dict with ``'name'`` and optional ``'args'`` keys.
+            path_override: If given, sets ``cfg['args']['model_name']`` to this value.
+        """
+        name = cfg['name']
+        args = cfg.get('args', {}).copy()
+        if path_override is not None:
+            args['model_name'] = path_override
+        return getattr(module, name)(**args)
+
     @classmethod
     def from_pretrained(
         cls,
         path: str,
         config_file: str = "pipeline.json",
         target_flow_model: str = 'shape_slat_1024',
-        low_cpu_mem_usage: bool = False,  # For BaseAdapter compatibility
-        image_cond_model_path: Optional[str] = None,  # Override for local DINOv3 path
-        rembg_model_path: Optional[str] = None,  # Override for local rembg path
+        image_cond_model_path: Optional[str] = None,
+        rembg_model_path: Optional[str] = None,
         **kwargs,
     ) -> "Trellis2PseudoPipeline":
-        """
-        Load a pretrained Trellis2 model.
-        
-        This method loads the original Trellis2 pipeline and restructures it
-        into the pseudo-pipeline format.
-        
+        """Load a pretrained Trellis2 model from a local directory or HF repo.
+
         Args:
-            path: Path to model checkpoint (local or HuggingFace repo)
-            config_file: Pipeline config filename
-            target_flow_model: Which flow model to use as primary transformer
-            low_cpu_mem_usage: Ignored (for BaseAdapter compatibility)
-            image_cond_model_path: Override path for image conditioning model (DINOv3)
-            rembg_model_path: Override path for background removal model
-            **kwargs: Additional arguments
-        
-        Returns:
-            Trellis2PseudoPipeline instance
+            path: Local directory or HuggingFace repo id.
+            config_file: Name of the pipeline config JSON inside *path*.
+            target_flow_model: Which flow model to designate as the trainable
+                transformer (e.g. ``'shape_slat_1024'``).
+            image_cond_model_path: Override the DINOv3 model path from config.
+            rembg_model_path: Override the rembg model path from config.
         """
-        # Import Trellis2 modules
         import sys
         trellis_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'third_party', 'TRELLIS.2')
         if trellis_path not in sys.path:
             sys.path.insert(0, os.path.abspath(trellis_path))
-        
+
         from trellis2 import models as trellis_models
         from trellis2.pipelines import samplers, rembg
         from trellis2.modules import image_feature_extractor
-        
-        # Check if local path
-        is_local = os.path.exists(os.path.join(path, config_file))
-        
-        if is_local:
-            config_path = os.path.join(path, config_file)
-        else:
+
+        config_path = os.path.join(path, config_file)
+        if not os.path.exists(config_path):
             from huggingface_hub import hf_hub_download
             config_path = hf_hub_download(path, config_file)
-        
+
         with open(config_path, 'r') as f:
             args = json.load(f)['args']
-        
-        # Load all models
+
+        allowed = set(cls.REQUIRED_MODELS + cls.OPTIONAL_MODELS)
         _models = {}
-        model_names_to_load = cls.REQUIRED_MODELS + cls.OPTIONAL_MODELS
         for k, v in args['models'].items():
-            if k not in model_names_to_load:
+            if k not in allowed:
                 continue
-            try:
-                _models[k] = trellis_models.from_pretrained(os.path.join(path, v))
-            except Exception:
-                try:
-                    _models[k] = trellis_models.from_pretrained(v)
-                except Exception as e:
-                    if k in cls.REQUIRED_MODELS:
-                        raise RuntimeError(f"Failed to load required model '{k}': {e}")
-                    # Optional model, skip
-                    pass
-        
-        # Load samplers
-        sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(
-            **args['sparse_structure_sampler']['args']
+            local_path = os.path.join(path, v)
+            if os.path.exists(f"{local_path}.json"):
+                _models[k] = trellis_models.from_pretrained(local_path)
+            else:
+                _models[k] = trellis_models.from_pretrained(v)
+
+        sparse_structure_sampler = cls._instantiate(samplers, args['sparse_structure_sampler'])
+        shape_slat_sampler       = cls._instantiate(samplers, args['shape_slat_sampler'])
+        tex_slat_sampler         = cls._instantiate(samplers, args['tex_slat_sampler'])
+
+        image_cond_model = cls._instantiate(
+            image_feature_extractor, args['image_cond_model'],
+            path_override=image_cond_model_path,
         )
-        shape_slat_sampler = getattr(samplers, args['shape_slat_sampler']['name'])(
-            **args['shape_slat_sampler']['args']
-        )
-        tex_slat_sampler = getattr(samplers, args['tex_slat_sampler']['name'])(
-            **args['tex_slat_sampler']['args']
-        )
-        
-        # Load image conditioning model (allow override path)
-        image_cond_args = args['image_cond_model']['args'].copy()
-        if image_cond_model_path is not None:
-            image_cond_args['model_name'] = image_cond_model_path
-        image_cond_model = getattr(image_feature_extractor, args['image_cond_model']['name'])(
-            **image_cond_args
-        )
-        
-        # Load rembg model (optional, allow override path)
+
         rembg_model = None
-        if 'rembg_model' in args and args['rembg_model']:
-            rembg_args = args['rembg_model']['args'].copy()
-            if rembg_model_path is not None:
-                rembg_args['model_name'] = rembg_model_path
-            rembg_model = getattr(rembg, args['rembg_model']['name'])(
-                **rembg_args
-            )
-        
+        if args.get('rembg_model'):
+            rembg_cfg = args['rembg_model']
+            if isinstance(rembg_cfg, str):
+                rembg_cfg = {'name': rembg_cfg, 'args': {}}
+            rembg_model = cls._instantiate(rembg, rembg_cfg, path_override=rembg_model_path)
+
         return cls(
             models=_models,
             image_cond_model=image_cond_model,
@@ -279,10 +261,10 @@ class Trellis2PseudoPipeline:
             shape_slat_sampler=shape_slat_sampler,
             tex_slat_sampler=tex_slat_sampler,
             sparse_structure_sampler_params=args['sparse_structure_sampler']['params'],
-            shape_slat_sampler_params=args['shape_slat_sampler']['params'],
-            tex_slat_sampler_params=args['tex_slat_sampler']['params'],
-            shape_slat_normalization=args['shape_slat_normalization'],
-            tex_slat_normalization=args['tex_slat_normalization'],
+            shape_slat_sampler_params=args['shape_slat_sampler'].get('params', {}),
+            tex_slat_sampler_params=args['tex_slat_sampler'].get('params', {}),
+            shape_slat_normalization=args.get('shape_slat_normalization'),
+            tex_slat_normalization=args.get('tex_slat_normalization'),
             rembg_model=rembg_model,
             target_flow_model=target_flow_model,
         )
@@ -443,7 +425,7 @@ class Trellis2PseudoPipeline:
             stage: One of 'shape', 'tex', 'dense', or None.
                    None → ``self.transformer`` (backward compatible with single-stage).
             resolution: Model resolution variant (512 or 1024). Only matters for
-                        shape/tex stages.
+                        shape/tex stages. Can be a tuple (H, W).
 
         Returns:
             The nn.Module for the requested stage.
@@ -451,6 +433,8 @@ class Trellis2PseudoPipeline:
         Raises:
             ValueError: If the requested model is not available.
         """
+        if isinstance(resolution, (tuple, list)):
+            resolution = resolution[0]
         if stage is None:
             return self.transformer
 

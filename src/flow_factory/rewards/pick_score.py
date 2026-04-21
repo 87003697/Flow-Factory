@@ -117,9 +117,7 @@ class PickScoreRewardModel(PointwiseRewardModel):
         else:
             scores = self._compute_scores_batch(prompt, image)
         
-        # Normalize to 0-1 range
         scores = scores / 26
-        
         return RewardModelOutput(rewards=scores, extra_info={})
 
 
