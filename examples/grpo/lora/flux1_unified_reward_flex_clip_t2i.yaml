@@ -1,16 +1,11 @@
 # ============================================================
 # FLUX.1 GRPO LoRA + UnifiedReward-2.0 Flex Pairwise + CLIP
 # ============================================================
-# This example combines two reward signals for T2I training:
-#   - UnifiedReward-Flex (pairwise/groupwise, weight=0.7):
-#     multi-dimensional JSON-structured win-rate reward that
-#     compares all C(K,2) pairs and scores across categories
-#     (Semantic Alignment, Quality, Aesthetics).
-#   - CLIP (pointwise, weight=0.3): text-image alignment score.
-#
-# GDPO normalises each reward independently within its group
-# before combining, preventing CLIP from being dominated by the
-# always-0.5-mean pairwise signal.
+# Training reward: UnifiedReward-Flex (pairwise/groupwise)
+#   multi-dimensional JSON-structured win-rate that compares all
+#   C(K,2) pairs within each group and scores across categories
+#   (Semantic Alignment, Quality, Aesthetics).
+# Evaluation reward: PickScore (pointwise, held-out metric).
 #
 # Prerequisites:
 #   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
@@ -116,7 +111,6 @@ rewards:
   # Pairwise (groupwise): UnifiedReward-Flex multi-dimensional win-rate
   - name: "unified_reward_flex_image_pairwise"
     reward_model: "unified_reward_flex_image_pairwise"
-    weight: 0.7
     batch_size: 1
     api_base_url: "http://localhost:8080/v1"
     api_key: "EMPTY"
@@ -130,28 +124,12 @@ rewards:
     async_reward: true
     num_workers: 2
 
-  # Pointwise: CLIP text-image alignment
-  - name: "clip"
-    reward_model: "clip"
-    weight: 0.3
-    batch_size: 16
-    device: "cuda"
-    dtype: bfloat16
 
 # Evaluation Reward Models (pointwise only; groupwise models are
 # skipped during eval)
 eval_rewards:
-  - name: "unified_reward_image_acs"
-    reward_model: "unified_reward_image_acs"
-    batch_size: 8
-    api_base_url: "http://localhost:8080/v1"
-    api_key: "EMPTY"
-    vlm_model: "UnifiedReward"
-    alignment_weight: 1.0
-    coherence_weight: 1.0
-    style_weight: 1.0
-    max_concurrent: 100
-    max_retries: 10
-    timeout: 120
-    async_reward: true
-    num_workers: 4
+  - name: "pick_score"
+    reward_model: "PickScore"
+    batch_size: 16
+    device: "cuda"
+    dtype: bfloat16

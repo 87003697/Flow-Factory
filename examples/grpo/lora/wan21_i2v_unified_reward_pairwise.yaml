@@ -1,0 +1,162 @@
+# ============================================================
+# Wan2.1 I2V GRPO LoRA + UnifiedReward-Flex Pairwise Reward
+# ============================================================
+# Training reward: unified_reward_flex_video_pairwise (groupwise)
+#   Compares all C(K,2) pairs within each group; each API call
+#   sends max_frames frames from Video 1 followed by max_frames
+#   frames from Video 2 (first-half / second-half split).
+#   The model outputs structured JSON with per-category winners.
+# Evaluation reward: unified_reward_video_aps (pointwise, APS).
+#
+# Note: group_size is reduced to 4 (C(4,2)=6 pairs per group).
+#   group_size=16 would require C(16,2)=120 API calls per group.
+#
+# Prerequisites:
+#   1. Start a vLLM server on a separate GPU (e.g., GPU 7).
+#      Each API call sends 2*max_frames images; with max_frames=8
+#      that is 16 images per call, well within the limit of 32:
+#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-Flex-qwen3vl-8b \
+#              --served-model-name UnifiedReward --host 0.0.0.0 --port 8080 \
+#              --trust-remote-code --gpu-memory-utilization 0.9 \
+#              --enable-prefix-caching \
+#              --limit-mm-per-prompt.image 32
+#   2. Use the remaining GPUs for training (e.g., GPU 0-6):
+#          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/wan21_i2v_unified_reward_pairwise.yaml
+# ============================================================
+
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml # Switch to `config/accelerate_configs/fsdp2.yaml` if you have limited GPU memory.
+num_processes: 7  # 7 GPUs for training, 1 GPU reserved for vLLM server
+main_process_port: 29500
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/sharegpt4o_image_mini"  # Path to dataset folder
+  preprocessing_batch_size: 8  # Batch size for preprocessing
+  dataloader_num_workers: 16  # Number of workers for DataLoader
+  force_reprocess: true  # Force reprocessing of the dataset
+  cache_dir: "~/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
+  max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
+  sampler_type: "group_contiguous"  # pairwise (groupwise) rewards require all group samples on the same rank
+
+# Model Configuration
+model:
+  finetune_type: 'lora' # Options: full, lora
+  lora_rank : 64
+  lora_alpha : 128
+  target_components: 'transformer' # Options: transformer
+  target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
+  model_name_or_path: "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"  # Wan-AI/Wan2.1-I2V-14B-480P-Diffusers / Wan-AI/Wan2.1-I2V-14B-720P-Diffusers
+  model_type: "wan2_i2v"  # wan2_t2v, wan2_i2v, wan2_v2v
+  resume_path: null # Path to load previous checkpoint/lora adapter
+  resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
+
+log:
+  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  project: "Flow-Factory"  # Project name for logging
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
+  save_freq: 20  # Save frequency in epochs (0 to disable)
+  save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
+
+# Training Configuration
+train:
+  # Trainer settings
+  trainer_type: 'grpo' # Options: 'grpo', 'nft', 'awm'
+  advantage_aggregation: 'gdpo' # Options: 'sum', 'gdpo'
+  # Clipping
+  clip_range: 1.0e-4  # PPO/GRPO clipping range
+  adv_clip_range: 5.0  # Advantage clipping range
+  # KL div
+  kl_type: 'v-based' # Options: 'x-based', 'v-based'
+  kl_beta: 0 # KL divergence coefficient. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
+  ref_param_device: 'cuda' # Options: cpu, cuda
+
+  # Sampling settings
+  resolution: 240  # Can be int or [height, width]
+  num_frames: 5 # (F - 1) mod 4 == 0
+  num_inference_steps: 10  # Number of timesteps
+  guidance_scale: 5.0  # Guidance scale for sampling
+
+  # Batch and sampling
+  per_device_batch_size: 1  # Batch size per device
+  group_size: 4  # Reduced from 16: C(4,2)=6 pairs vs C(16,2)=120 pairs per group
+  global_std: false  # Use global std for advantage normalization
+  unique_sample_num_per_epoch: 48  # Unique samples per group
+  gradient_step_per_epoch: 2  # Gradient steps per epoch
+  gradient_accumulation_steps: auto  # Options: auto, or positive integer. When set, `gradient_step_per_epoch` is ignored.
+  
+  # Optimization
+  learning_rate: 1.0e-4  # Initial learning rate
+  adam_weight_decay: 1.0e-4  # AdamW weight decay
+  adam_betas: [0.9, 0.999]  # AdamW betas
+  adam_epsilon: 1.0e-8  # AdamW epsilon
+  max_grad_norm: 1.0  # Max gradient norm for clipping
+
+  # EMA
+  ema_decay: 0.9  # EMA decay rate (0 to disable)
+  ema_update_interval: 4  # EMA update interval (in epochs)
+  ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
+
+  # Gradient checkpointing
+  enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory with extra compute
+
+  # Seed
+  seed: 42
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
+  noise_level: 0.9  # Noise level for sampling
+  num_sde_steps: 1  # Number of noise steps
+  sde_steps: [1, 2, 3]  # Custom noise window, noise steps are randomly selected from this list during training
+  seed: 42  # Scheduler seed (for noise step selection)
+
+# Evaluation settings
+eval:
+  resolution: 480  # Evaluation resolution
+  num_frames: 5 # Evaluation frames
+  per_device_batch_size: 1  # Eval batch size
+  guidance_scale: 5.0  # Guidance scale for sampling
+  num_inference_steps: 28  # Number of eval timesteps
+  eval_freq: 20  # Eval frequency in epochs (0 to disable)
+  seed: 42  # Eval seed (defaults to training seed)
+
+# Reward Model Configuration
+rewards:
+  - name: "unified_reward_flex_video_pairwise"
+    reward_model: "unified_reward_flex_video_pairwise"
+    batch_size: 1
+    api_base_url: "http://localhost:8080/v1"
+    api_key: "EMPTY"
+    vlm_model: "UnifiedReward"
+    max_frames: 8        # 8 frames × 2 videos = 16 images per API call
+    max_concurrent: 8
+    max_retries: 5
+    timeout: 180
+    max_pairs: 6
+    overall_weight: 0.3
+    dim_weight: 0.7
+    async_reward: true
+    num_workers: 2
+
+# Evaluation Reward Models (pointwise only; groupwise models are
+# skipped during eval)
+eval_rewards:
+  - name: "unified_reward_video_aps"
+    reward_model: "unified_reward_video_aps"
+    batch_size: 4
+    api_base_url: "http://localhost:8080/v1"
+    api_key: "EMPTY"
+    vlm_model: "UnifiedReward"
+    alignment_weight: 1.0
+    physics_weight: 1.0
+    style_weight: 1.0
+    max_frames: 16
+    max_concurrent: 100
+    max_retries: 10
+    timeout: 120
+    async_reward: true
+    num_workers: 4
