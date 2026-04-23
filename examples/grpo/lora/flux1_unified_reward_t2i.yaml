@@ -1,7 +1,7 @@
 # ============================================================
 # FLUX.1 GRPO LoRA + UnifiedReward-2.0 (ACS) Reward
 # ============================================================
-# This example uses UnifiedReward-2.0-qwen3vl-8b as the reward
+# This example uses UnifiedReward-2.0-qwen35-9b as the reward
 # model via vLLM's OpenAI-compatible API, scoring T2I generation
 # along three axes: Alignment / Coherence / Style (ACS).
 #
@@ -10,11 +10,11 @@
 #      sends 1 image per request, so the default upstream cap is
 #      plenty; 32 matches the value used by UnifiedReward's upstream
 #      `vllm_server.sh` and leaves headroom for the I2V example:
-#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen3vl-8b \
-#              --served-model-name UnifiedReward --host 0.0.0.0 --port 8080 \
-#              --trust-remote-code --gpu-memory-utilization 0.9 \
-#              --enable-prefix-caching \
-#              --limit-mm-per-prompt '{"image": 32}'
+        #  CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen35-9b \
+        #      --served-model-name UnifiedReward --host 0.0.0.0 --port 8080 \
+        #      --trust-remote-code --gpu-memory-utilization 0.9 \
+        #      --enable-prefix-caching \
+        #      --limit-mm-per-prompt '{"image": 32}'
 #      (vLLM >= 0.20 also accepts the dotted form
 #      `--limit-mm-per-prompt.image 32`.)
 #   2. Use the remaining GPUs for training (e.g., GPU 0-6):

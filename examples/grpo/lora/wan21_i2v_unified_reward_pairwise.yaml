@@ -15,7 +15,7 @@
 #   1. Start a vLLM server on a separate GPU (e.g., GPU 7).
 #      Each API call sends 2*max_frames images; with max_frames=8
 #      that is 16 images per call, well within the limit of 32:
-#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-Flex-qwen3vl-8b \
+#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-Flex-qwen35-9b \
 #              --served-model-name UnifiedReward --host 0.0.0.0 --port 8080 \
 #              --trust-remote-code --gpu-memory-utilization 0.9 \
 #              --enable-prefix-caching \

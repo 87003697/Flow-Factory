@@ -1,7 +1,7 @@
 # ============================================================
 # Wan2.1 I2V GRPO LoRA + UnifiedReward-2.0 (APS) Reward
 # ============================================================
-# This example uses UnifiedReward-2.0-qwen3vl-8b as the reward
+# This example uses UnifiedReward-2.0-qwen35-9b as the reward
 # model for image-to-video generation via vLLM's OpenAI-compatible
 # API, scoring along three axes: Alignment / Physics / Style (APS).
 # The reference image is automatically prepended to the frame
@@ -12,7 +12,7 @@
 #      `--limit-mm-per-prompt` flag must bound the per-request image
 #      count to `max_frames + 1` (reference image) or higher; 32 is a
 #      safe default for max_frames=16:
-#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen3vl-8b \
+#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen35-9b \
 #              --served-model-name UnifiedReward --host 0.0.0.0 --port 8080 \
 #              --trust-remote-code --gpu-memory-utilization 0.9 \
 #              --enable-prefix-caching \

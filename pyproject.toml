@@ -75,7 +75,7 @@ nvidia = [
 ]
 
 all = [
-    "flow-factory[deepspeed,quantization]",
+    "flow-factory[deepspeed,quantization,wandb]",
 ]
 
 [project.scripts]

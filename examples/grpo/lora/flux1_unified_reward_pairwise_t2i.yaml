@@ -1,14 +1,14 @@
 # ============================================================
 # FLUX.1 GRPO LoRA + UnifiedReward-2.0 Pairwise (Think) Reward
 # ============================================================
-# This example uses UnifiedReward-2.0-qwen3vl-8b as a pairwise
+# This example uses UnifiedReward-2.0-qwen35-9b as a pairwise
 # reward model via vLLM's OpenAI-compatible API, comparing all
 # C(K,2) pairs within each group and aggregating per-sample win
 # rates.
 #
 # Prerequisites:
 #   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
-#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen3vl-8b \
+#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen35-9b \
 #              --served-model-name UnifiedReward --host 0.0.0.0 --port 8080 \
 #              --trust-remote-code --gpu-memory-utilization 0.9 \
 #              --enable-prefix-caching \
