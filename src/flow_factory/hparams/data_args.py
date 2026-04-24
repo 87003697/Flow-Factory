@@ -75,7 +75,9 @@ class DataArguments(ArgABC):
             )
         },
     )
-    sampler_type: Literal["auto", "distributed_k_repeat", "group_contiguous"] = field(
+    sampler_type: Literal[
+        "auto", "distributed_k_repeat", "group_contiguous", "distributed_group_aligned"
+    ] = field(
         default="auto",
         metadata={
             "help": (
@@ -86,7 +88,10 @@ class DataArguments(ArgABC):
                 "'distributed_k_repeat': shuffle K copies globally across ranks "
                 "(fewer constraints, extra all-gather communication). "
                 "'group_contiguous': keep all K copies of each group on the same rank "
-                "(requires unique_sample_num divisible by world_size)."
+                "(requires unique_sample_num divisible by world_size). "
+                "'distributed_group_aligned': scatter K copies across ranks within "
+                "the same global iteration for load-balanced cross-GPU upstream "
+                "sharing (requires W*B divisible by group_size)."
             )
         },
     )

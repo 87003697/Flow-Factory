@@ -31,6 +31,12 @@ _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     'clip': 'flow_factory.rewards.clip.CLIPRewardModel',
     'ocr': 'flow_factory.rewards.ocr.OCRRewardModel',
     'vllm_evaluate': 'flow_factory.rewards.vllm_evaluate.VLMEvaluateRewardModel',
+    'unified_reward_image_acs': 'flow_factory.rewards.unified_reward.UnifiedRewardImageGenACSRewardModel',
+    'unified_reward_video_aps': 'flow_factory.rewards.unified_reward.UnifiedRewardVideoGenAPSRewardModel',
+    'unified_reward_think_image_pairwise': 'flow_factory.rewards.unified_reward_pairwise.UnifiedRewardThinkImagePairwise',
+    'unified_reward_think_video_pairwise': 'flow_factory.rewards.unified_reward_pairwise.UnifiedRewardThinkVideoPairwise',
+    'unified_reward_flex_image_pairwise': 'flow_factory.rewards.unified_reward_pairwise.UnifiedRewardFlexImagePairwise',
+    'unified_reward_flex_video_pairwise': 'flow_factory.rewards.unified_reward_pairwise.UnifiedRewardFlexVideoPairwise',
 }
 _REWARD_MODEL_REGISTRY = {k.lower(): v for k, v in _REWARD_MODEL_REGISTRY.items()}
 

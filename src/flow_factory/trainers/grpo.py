@@ -192,9 +192,6 @@ class GRPOTrainer(BaseTrainer):
             perm = torch.randperm(len(samples), generator=perm_gen)
             shuffled_samples = [samples[i] for i in perm]
 
-            # Create batches for optimization
-            # `BaseSample.stack` will try to stack all tensor fields,
-            # stack non-tensor fields as a list, keep shared fields as single value
             sample_batches : List[Dict[str, Union[torch.Tensor, Any, List[Any]]]] = [
                 BaseSample.stack(shuffled_samples[i:i + self.training_args.per_device_batch_size])
                 for i in range(0, len(shuffled_samples), self.training_args.per_device_batch_size)

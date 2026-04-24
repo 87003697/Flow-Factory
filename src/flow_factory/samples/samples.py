@@ -311,7 +311,6 @@ class BaseSample:
         # 2. Tensor fields, try to stack
         # Stack tensors with matching shapes
         if isinstance(first, torch.Tensor):
-            # Assume all tensors
             if all(v.shape == first.shape for v in values):
                 return torch.stack(values)
             return values

@@ -1,3 +1,22 @@
+# ============================================================
+# Trellis2 Tex GRPO LoRA + UnifiedReward-2.0 (APS) Reward
+# ============================================================
+# This example uses UnifiedReward-2.0-qwen35-9b as the reward
+# model for 3D texture generation via vLLM's OpenAI-compatible
+# API, scoring rendered multi-view frames along three axes:
+# Alignment / Physics / Style (APS).
+#
+# Prerequisites:
+#   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
+#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen35-9b \
+#              --served-model-name UnifiedReward --host 0.0.0.0 --port 8080 \
+#              --trust-remote-code --gpu-memory-utilization 0.9 \
+#              --enable-prefix-caching \
+#              --limit-mm-per-prompt '{"image": 32}'
+#   2. Use the remaining GPUs for training (e.g., GPU 0-6):
+#          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/trellis2_tex_unified_reward.yaml
+# ============================================================
+
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
 config_file: null  # Path to distributed config file (optional)
@@ -27,18 +46,18 @@ model:
   resume_path: null  # Path to load previous checkpoint/lora adapter
   resume_type: null  # Options: lora, full, state. Null to auto-detect based on `finetune_type`
   # Trellis2-specific
-  target_flow_model: "shape_slat_1024"  # Options: dense, shape_slat_1024, shape_slat_512, tex_slat_1024, tex_slat_512
+  target_flow_model: "tex_slat_1024"  # Options: dense, shape_slat_1024, shape_slat_512, tex_slat_1024, tex_slat_512
   decode_output: true  # Decode latents to mesh and render multiview frames for reward
-  render_num_frames: 24  # Number of views to render per sample
+  render_num_frames: 16  # Number of views to render per sample
   render_resolution: 512  # Render resolution in pixels
   render_bg_color: [1, 1, 1]  # Render background color (RGB, 0-1 float)
   envmap_path: null  # Path to .exr HDR envmap file (null for default)
   # Per-stage SDE overrides (consumed by Trellis2Adapter._stage_sde_kwargs)
-  # Shape stage inherits global Flow-SDE defaults — no override needed.
+  # Tex stage inherits global Flow-SDE defaults — no override needed.
   dense_sde:
     dynamics_type: "ODE"  # Dense stage uses deterministic ODE (not trained)
-  tex_sde:
-    dynamics_type: "ODE"  # Tex stage uses deterministic ODE (downstream for reward only)
+  shape_sde:
+    dynamics_type: "ODE"  # Shape stage uses deterministic ODE (upstream, not trained)
 
 log:
   run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
@@ -95,9 +114,9 @@ train:
 
 # Scheduler Configuration (global defaults, overridden per-stage via model.{stage}_sde)
 scheduler:
-  dynamics_type: "Flow-SDE"  # FlowGRPO SDE for the training stage (shape)
-  noise_level: 0.7  # Noise level for SDE sampling
-  num_sde_steps: 1  # Number of SDE noise steps per rollout (1 of 12 steps is stochastic)
+  dynamics_type: "Flow-SDE"  # FlowGRPO SDE for the training stage (tex)
+  noise_level: 1.0  # Noise level for SDE sampling
+  num_sde_steps: 1  # Number of SDE noise steps per rollout
   sde_steps: [1, 2, 3]  # Eligible timestep indices for SDE noise injection
   seed: 42  # Scheduler seed (for noise step selection)
 
@@ -112,17 +131,28 @@ eval:
 
 # Reward Model Configuration
 rewards:
-  - name: "pickscore"
-    reward_model: "PickScore"
-    weight: 1.0
-    batch_size: 8
+  - name: "unified_reward_video_aps"
+    reward_model: "unified_reward_video_aps"
+    batch_size: 4
     device: "cuda"
     dtype: bfloat16
+    api_base_url: "http://localhost:8080/v1"
+    vlm_model: "UnifiedReward"
+    alignment_weight: 1.0
+    physics_weight: 0.5
+    style_weight: 0.5
+    max_frames: 32
 
 # Optional Evaluation Reward Models
 eval_rewards:
-  name: "pickscore"
-  reward_model: "PickScore"
-  batch_size: 8
+  name: "unified_reward_video_aps"
+  reward_model: "unified_reward_video_aps"
+  batch_size: 4
   device: "cuda"
   dtype: bfloat16
+  api_base_url: "http://localhost:8080/v1"
+  vlm_model: "UnifiedReward"
+  alignment_weight: 1.0
+  physics_weight: 0.5
+  style_weight: 0.5
+  max_frames: 32

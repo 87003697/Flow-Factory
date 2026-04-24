@@ -212,8 +212,17 @@ class Arguments(ArgABC):
                 sample_num_per_iteration * ta.gradient_step_per_epoch
             ) // math.gcd(ta.group_size, sample_num_per_iteration)
 
-        if self.data_args.sampler_type == "group_contiguous":
+        sampler = self.data_args.sampler_type
+        if sampler == "group_contiguous":
             step = math.lcm(base_step, world_size)
+        elif sampler == "distributed_group_aligned":
+            if sample_num_per_iteration % ta.group_size != 0:
+                raise ValueError(
+                    f"distributed_group_aligned requires W*B ({sample_num_per_iteration}) "
+                    f"to be divisible by group_size ({ta.group_size})."
+                )
+            groups_per_iter = sample_num_per_iteration // ta.group_size
+            step = max(base_step, groups_per_iter)
         else:
             step = base_step
 
@@ -225,7 +234,7 @@ class Arguments(ArgABC):
                 if not manual
                 else ")"
             )
-            if self.data_args.sampler_type == "group_contiguous":
+            if sampler == "group_contiguous":
                 logger.warning(
                     f"GroupContiguousSampler: adjusted `unique_sample_num_per_epoch` "
                     f"from {ta.unique_sample_num_per_epoch} to {new_m} to satisfy:\n"
@@ -237,6 +246,14 @@ class Arguments(ArgABC):
                     f"* per_device_batch_size({ta.per_device_batch_size})"
                     + constraint_suffix
                     + " == 0"
+                )
+            elif sampler == "distributed_group_aligned":
+                logger.warning(
+                    f"DistributedGroupAlignedSampler: adjusted "
+                    f"`unique_sample_num_per_epoch` from "
+                    f"{ta.unique_sample_num_per_epoch} to {new_m} to be a "
+                    f"multiple of groups_per_iter "
+                    f"({sample_num_per_iteration // ta.group_size})."
                 )
             else:
                 logger.warning(

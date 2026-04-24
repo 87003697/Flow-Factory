@@ -349,10 +349,7 @@ class Trellis2PseudoPipeline:
             center[1] + size // 2
         )
         output = output.crop(bbox)
-        output_np = np.array(output).astype(np.float32) / 255
-        output = output_np[:, :, :3] * output_np[:, :, 3:4]
-        output = Image.fromarray((output * 255).astype(np.uint8))
-        return output
+        return output  # RGBA — downstream (Trellis2Sample) handles bg-color compositing
     
     def get_cond(
         self,
@@ -364,17 +361,24 @@ class Trellis2PseudoPipeline:
         Get conditioning embeddings from images.
         
         Args:
-            images: List of PIL images
+            images: List of PIL images (RGB or RGBA; RGBA is composited onto black)
             resolution: Resolution for image encoder
             include_neg_cond: Whether to include negative conditioning
         
         Returns:
             Dict with 'cond' and optionally 'neg_cond' tensors
         """
+        rgb_images = [
+            Image.alpha_composite(
+                Image.new('RGBA', img.size, (0, 0, 0, 255)), img,
+            ).convert('RGB') if img.mode == 'RGBA' else img
+            for img in images
+        ]
+
         if hasattr(self.image_encoder, 'image_size'):
             self.image_encoder.image_size = resolution
         
-        cond = self.image_encoder(images)
+        cond = self.image_encoder(rgb_images)
         
         if not include_neg_cond:
             return {'cond': cond}

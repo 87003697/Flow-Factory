@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 from contextlib import contextmanager
 
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -45,7 +46,7 @@ from PIL import Image
 from accelerate import Accelerator
 
 from ..abc import BaseAdapter
-from ...samples import ImageConditionSample
+from ...samples import I2VSample
 from ...hparams import Arguments
 from ...scheduler import SDESchedulerOutput
 from ...utils.trajectory_collector import (
@@ -79,6 +80,40 @@ def _setup_trellis_path():
 _trellis_path = _setup_trellis_path()
 
 
+def _composite_rgba_pil(
+    img: Image.Image,
+    bg_color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> Image.Image:
+    """Alpha-composite an RGBA PIL image onto solid *bg_color*, return RGB PIL.
+
+    Non-RGBA images are returned as-is (converted to RGB if needed).
+    *bg_color* uses float [0, 1] per channel, matching ``render_bg_color``.
+    """
+    if not isinstance(img, Image.Image):
+        return img
+    if img.mode != 'RGBA':
+        return img.convert('RGB') if img.mode != 'RGB' else img
+    bg_rgba = tuple(int(round(c * 255)) for c in bg_color) + (255,)
+    bg = Image.new('RGBA', img.size, bg_rgba)
+    return Image.alpha_composite(bg, img).convert('RGB')
+
+
+def _apply_bg_to_condition_images(
+    samples: List['Trellis2Sample'],
+    condition_images_rgba: List[Optional[List[Image.Image]]],
+    bg_color: Tuple[float, float, float],
+) -> None:
+    """Overwrite each sample's ``condition_images`` by compositing the original
+    RGBA images onto *bg_color*, so the background matches the rendered video."""
+    for b, s in enumerate(samples):
+        raw_imgs = condition_images_rgba[b]
+        if raw_imgs is not None:
+            raw_imgs = standardize_image_batch(raw_imgs, 'pil')
+            s.condition_images = [
+                _composite_rgba_pil(img, bg_color) for img in raw_imgs
+            ]
+
+
 def _compute_adaptive_distance(
     fov_deg: float,
     fill_ratio: float = 0.9,
@@ -98,7 +133,7 @@ def _compute_adaptive_distance(
 # ======================== Sample Dataclass ========================
 
 @dataclass
-class Trellis2Sample(ImageConditionSample):
+class Trellis2Sample(I2VSample):
     """
     Sample output for Trellis2 models.
     
@@ -194,6 +229,50 @@ class Trellis2Sample(ImageConditionSample):
         'all_latents', 'log_probs', 'image_cond', 'neg_image_cond',
         'latent_index_map', 'log_prob_index_map', 'timesteps',
     }
+
+    _STAGE_BROADCAST_FIELDS: ClassVar[Dict[str, tuple]] = {
+        'dense': ('sparse_coords', 'dense_final_latent'),
+        'shape': ('shape_final_latent',),
+    }
+    _STAGE_METADATA_FIELDS: ClassVar[Dict[str, tuple]] = {
+        'dense': (
+            'dense_all_latents', 'dense_log_probs',
+            'dense_image_cond', 'dense_neg_image_cond',
+            'dense_latent_index_map', 'dense_log_prob_index_map', 'dense_timesteps',
+        ),
+        'shape': (
+            'shape_all_latents', 'shape_log_probs',
+            'shape_image_cond', 'shape_neg_image_cond',
+            'shape_latent_index_map', 'shape_log_prob_index_map', 'shape_timesteps',
+        ),
+    }
+
+    def __post_init__(self):
+        if self.condition_images is not None:
+            images = (self.condition_images if isinstance(self.condition_images, list)
+                      else [self.condition_images])
+            for i, img in enumerate(images):
+                if isinstance(img, Image.Image) and img.mode == 'RGBA':
+                    images[i] = _composite_rgba_pil(img, (0.0, 0.0, 0.0))
+            self.condition_images = images
+        super().__post_init__()
+
+    def copy_stage_metadata_from(
+        self, source: 'Trellis2Sample', stages: Union[str, List[str]],
+    ) -> None:
+        """Copy non-broadcast upstream metadata from *source* into this sample.
+
+        Only copies auxiliary fields (trajectories, log-probs, cond tensors,
+        index maps, timesteps) that are **not** broadcast across ranks.  The
+        broadcast fields (``sparse_coords``, ``dense_final_latent``,
+        ``shape_final_latent``) must be set separately by the caller after
+        ``dist.broadcast``.
+        """
+        if isinstance(stages, str):
+            stages = [stages]
+        for stage in stages:
+            for field in self._STAGE_METADATA_FIELDS[stage]:
+                setattr(self, field, getattr(source, field))
 
     def activate_stage(self, stage: str) -> None:
         """Project per-stage fields to standard fields for training.
@@ -821,12 +900,10 @@ class Trellis2Adapter(BaseAdapter):
                 processed_images.append([])
                 continue
 
-            # Preprocess once — RGBA alpha channel is used directly when present,
-            # so REMBG inference is skipped for images loaded by Image3DDataset.
             processed = [self.pipeline.preprocess_image(img) for img in img_list]
             processed_images.append(processed)
 
-            # Encode at 512 px (dense stage)
+            # Encode at 512 px (dense stage) — get_cond handles RGBA→RGB internally
             cond_512 = self.pipeline.get_cond(processed, 512, include_neg_cond=True)
             all_conds_512.append(cond_512['cond'].squeeze(0).to(device))
             all_neg_conds_512.append(cond_512['neg_cond'].squeeze(0).to(device))
@@ -909,11 +986,10 @@ class Trellis2Adapter(BaseAdapter):
                 processed_images.append([])
                 continue
             
-            # Preprocess images
             processed = [self.pipeline.preprocess_image(img) for img in img_list]
             processed_images.append(processed)
             
-            # Get conditioning
+            # Get conditioning — get_cond handles RGBA→RGB internally
             cond_dict = self.pipeline.get_cond(processed, resolution, include_neg_cond)
             # Squeeze batch dim since we process one sample at a time
             # cond has shape (1, seq_len, hidden_dim) -> (seq_len, hidden_dim)
@@ -1041,7 +1117,7 @@ class Trellis2Adapter(BaseAdapter):
             sigma_min = scheduler._sigma_min
             pred_pos = self._forward_dense(t_val, latents, image_cond)
             if apply_cfg:
-                pred_neg = self._forward_dense(t_val, latents, neg_image_cond, bypass_ddp=True)
+                pred_neg = self._forward_dense(t_val, latents, neg_image_cond)
                 pred_v = self._apply_cfg_dense(
                     pred_pos.float(), pred_neg.float(), latents.float(),
                     t_val, guidance_scale, guidance_rescale, sigma_min,
@@ -1075,7 +1151,6 @@ class Trellis2Adapter(BaseAdapter):
                 pred_neg = self._forward_sparse(
                     t_val, x_t, neg_image_cond, concat_cond=concat_cond,
                     stage=stage, stage_resolution=stage_resolution,
-                    bypass_ddp=True,
                 )
                 pred_v = self._apply_cfg_sparse(
                     pred_pos, pred_neg, x_t, t_val, guidance_scale, guidance_rescale, sigma_min,
@@ -1083,6 +1158,8 @@ class Trellis2Adapter(BaseAdapter):
                 )
             else:
                 pred_v = pred_pos
+
+            pred_v = pred_v.replace(feats=pred_v.feats.float())
 
             output = scheduler.step(
                 pred_v, t_val, t_next_val, x_t,
@@ -1102,17 +1179,16 @@ class Trellis2Adapter(BaseAdapter):
 
     def _forward_dense(
         self, t: float, latents: torch.Tensor, cond: torch.Tensor,
-        bypass_ddp: bool = False,
     ) -> torch.Tensor:
         """Pure model forward for dense stage. Returns ``pred_v`` tensor.
 
-        No autocast — the model's own ``manual_cast`` handles dtype
-        transitions between float32 head/tail and bf16 blocks.
+        Autocast is explicitly disabled so the model's own ``manual_cast``
+        handles dtype transitions between float32 head/tail and bf16 blocks.
         Inputs should be float32 (matching official pipeline behavior).
         """
         device = self.device
         if 'dense' == self._training_stage:
-            flow_model = self._unwrap(self.transformer) if bypass_ddp else self.transformer
+            flow_model = self.transformer
         else:
             flow_model = self.pipeline.get_flow_model('dense')
 
@@ -1120,7 +1196,8 @@ class Trellis2Adapter(BaseAdapter):
         cond = cond.to(device=device, dtype=torch.float32)
         t_tensor = torch.full((latents.shape[0],), 1000 * t, device=device, dtype=torch.float32)  # (B,)
 
-        pred_v = flow_model(latents, t_tensor, cond)
+        with torch.autocast('cuda', enabled=False):
+            pred_v = flow_model(latents, t_tensor, cond)
         return pred_v
 
     # ---------------------- CFG helpers ----------------------
@@ -1216,25 +1293,99 @@ class Trellis2Adapter(BaseAdapter):
         concat_cond: Optional['SparseTensor'] = None,
         stage: str = 'shape',
         stage_resolution: int = 1024,
-        bypass_ddp: bool = False,
     ) -> 'SparseTensor':
         """Pure model forward for sparse stage. Returns ``pred_v`` SparseTensor.
 
+        Autocast is explicitly disabled so the model's own ``manual_cast``
+        handles dtype transitions between float32 head/tail and bf16 blocks.
         No CFG, no scheduler step — the caller handles both.
         """
         device = self.device
         if stage == self._training_stage:
-            flow_model = self._unwrap(self.transformer) if bypass_ddp else self.transformer
+            flow_model = self.transformer
         else:
             flow_model = self.pipeline.get_flow_model(stage, stage_resolution)
 
         cond = cond.to(device=device, dtype=torch.float32)
         t_tensor = torch.full((x_t.shape[0],), 1000 * t, device=device, dtype=torch.float32)  # (B,)
 
-        pred_v = flow_model(x=x_t, t=t_tensor, cond=cond, concat_cond=concat_cond)
+        with torch.autocast('cuda', enabled=False):
+            pred_v = flow_model(x=x_t, t=t_tensor, cond=cond, concat_cond=concat_cond)
         return pred_v
 
-    # ======================== Inference (Full Generation) ========================
+    def _get_stage_conditioning(self, stage, cond_512, neg_512, cond_1024, neg_1024):
+        """Return the (cond, neg_cond) pair appropriate for *stage*."""
+        if stage == 'dense':
+            return cond_512, neg_512
+        return cond_1024, neg_1024
+
+    def _run_stage_inference(
+        self,
+        stage: str,
+        samples: List['Trellis2Sample'],
+        image_cond: List[torch.Tensor],
+        neg_image_cond: List[torch.Tensor],
+        *,
+        resolution: int,
+        num_inference_steps: int,
+        guidance_scale: float,
+        guidance_interval: Tuple[float, float],
+        guidance_rescale: float,
+        generator: Optional[torch.Generator],
+        trajectory_indices: 'TrajectoryIndicesType',
+        extra_call_back_kwargs: List[str],
+        ss_resolution: int,
+        is_training_stage: bool,
+        compute_log_prob: bool,
+    ) -> None:
+        """Dispatch a single stage to the corresponding private method."""
+        if stage == 'dense':
+            self._inference_dense(
+                samples=samples, image_cond=image_cond,
+                neg_image_cond=neg_image_cond,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                guidance_interval=guidance_interval,
+                guidance_rescale=guidance_rescale,
+                generator=generator,
+                trajectory_indices=trajectory_indices,
+                extra_call_back_kwargs=extra_call_back_kwargs,
+                ss_resolution=ss_resolution,
+                is_training_stage=is_training_stage,
+                compute_log_prob=compute_log_prob,
+            )
+        elif stage == 'shape':
+            self._inference_shape(
+                samples=samples, image_cond=image_cond,
+                neg_image_cond=neg_image_cond,
+                resolution=resolution,
+                guidance_scale=guidance_scale,
+                guidance_interval=guidance_interval,
+                guidance_rescale=guidance_rescale,
+                generator=generator,
+                trajectory_indices=trajectory_indices,
+                extra_call_back_kwargs=extra_call_back_kwargs,
+                is_training_stage=is_training_stage,
+                compute_log_prob=compute_log_prob,
+            )
+        elif stage == 'tex':
+            self._inference_tex(
+                samples=samples, image_cond=image_cond,
+                neg_image_cond=neg_image_cond,
+                resolution=resolution,
+                guidance_scale=guidance_scale,
+                guidance_interval=guidance_interval,
+                guidance_rescale=guidance_rescale,
+                generator=generator,
+                trajectory_indices=trajectory_indices,
+                extra_call_back_kwargs=extra_call_back_kwargs,
+                is_training_stage=is_training_stage,
+                compute_log_prob=compute_log_prob,
+            )
+        else:
+            raise ValueError(
+                f"Unknown stage: {stage!r}. Expected 'dense', 'shape', or 'tex'."
+            )
 
     @torch.no_grad()
     def inference(
@@ -1268,13 +1419,20 @@ class Trellis2Adapter(BaseAdapter):
         # Render parameters (used when decode_output=True)
         render_num_frames: int = 24,
         render_resolution: int = 512,
+        render_bg_color: Tuple[float, float, float] = (0, 0, 0),
         envmap_path: Optional[str] = None,
+        # Pre-created samples (skip stub creation; enables stage-skip)
+        samples: Optional[List['Trellis2Sample']] = None,
         **kwargs,
     ) -> List[Trellis2Sample]:
         """Multi-stage inference dispatcher for Trellis2.
 
         Accepts either raw images or pre-encoded conditioning tensors
         (output of ``preprocess_func``).
+
+        When *samples* is provided the sample-stub creation step is skipped
+        and stages whose outputs are already present on the samples (e.g.
+        ``sparse_coords`` for dense) are automatically skipped.
 
         Stage definitions:
             - **dense**: Runs ``sparse_structure_flow_model`` on 5D dense latents.
@@ -1341,91 +1499,63 @@ class Trellis2Adapter(BaseAdapter):
                 image_cond_1024=image_cond_1024, neg_image_cond_1024=neg_image_cond_1024,
             )
 
-        # ── 3. Initialise sample stubs ─────────────────────────────────────────
-        samples = [
-            Trellis2Sample(
-                condition_images=condition_images[b] if condition_images is not None else None,
-                resolution=resolution,
-                prompt=prompt[b] if prompt else None,
-            )
-            for b in range(batch_size)
-        ]
+        # ── 3. Initialise sample stubs (skip if pre-created) ─────────────────
+        if samples is None:
+            samples = [
+                Trellis2Sample(
+                    condition_images=condition_images[b] if condition_images is not None else None,
+                    resolution=resolution,
+                    prompt=prompt[b] if prompt else None,
+                )
+                for b in range(batch_size)
+            ]
 
-        # ── 4. Dispatch each stage ─────────────────────────────────────────────
+        # ── 4. Dispatch each stage (skip stages already computed) ─────────────
         ss_resolution = 32 if resolution <= 512 else 64
 
         for stage in stages_list:
+            if stage == 'dense' and samples[0].sparse_coords is not None:
+                continue
+            if stage == 'shape' and samples[0].shape_final_latent is not None:
+                continue
+            if stage == 'tex' and samples[0].tex_final_latent is not None:
+                continue
+
             g = self._get_stage_guidance(
                 stage, guidance_scale, guidance_interval, guidance_rescale, sampler_params,
             )
-
-            if stage == 'dense':
-                self._inference_dense(
-                    samples=samples,
-                    image_cond=cond_512,
-                    neg_image_cond=neg_512,
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=g['guidance_scale'],
-                    guidance_interval=g['guidance_interval'],
-                    guidance_rescale=g['guidance_rescale'],
-                    generator=generator,
-                    trajectory_indices=trajectory_indices,
-                    extra_call_back_kwargs=extra_call_back_kwargs,
-                    ss_resolution=ss_resolution,
-                    is_training_stage=(stage == _mirror_stage),
-                    compute_log_prob=compute_log_prob,
-                )
-
-            elif stage == 'shape':
-                missing = [b for b, s in enumerate(samples) if s.sparse_coords is None]
-                assert not missing, (
-                    f"sample(s) {missing} have no sparse_coords. "
-                    "Run the 'dense' stage first or supply pre-computed coords."
-                )
-
-                self._inference_shape(
-                    samples=samples,
-                    image_cond=cond_1024,
-                    neg_image_cond=neg_1024,
-                    resolution=resolution,
-                    guidance_scale=g['guidance_scale'],
-                    guidance_interval=g['guidance_interval'],
-                    guidance_rescale=g['guidance_rescale'],
-                    generator=generator,
-                    trajectory_indices=trajectory_indices,
-                    extra_call_back_kwargs=extra_call_back_kwargs,
-                    is_training_stage=(stage == _mirror_stage),
-                    compute_log_prob=compute_log_prob,
-                )
-
-            elif stage == 'tex':
-                self._inference_tex(
-                    samples=samples,
-                    image_cond=cond_1024,
-                    neg_image_cond=neg_1024,
-                    resolution=resolution,
-                    guidance_scale=g['guidance_scale'],
-                    guidance_interval=g['guidance_interval'],
-                    guidance_rescale=g['guidance_rescale'],
-                    generator=generator,
-                    trajectory_indices=trajectory_indices,
-                    extra_call_back_kwargs=extra_call_back_kwargs,
-                    is_training_stage=(stage == _mirror_stage),
-                    compute_log_prob=compute_log_prob,
-                )
-
-            else:
-                raise ValueError(
-                    f"Unknown stage: {stage!r}. Expected 'dense', 'shape', or 'tex'."
-                )
+            is_training = (stage == _mirror_stage)
+            stage_cond, stage_neg = self._get_stage_conditioning(
+                stage, cond_512, neg_512, cond_1024, neg_1024,
+            )
+            self._run_stage_inference(
+                stage, samples, stage_cond, stage_neg,
+                resolution=resolution,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=g['guidance_scale'],
+                guidance_interval=g['guidance_interval'],
+                guidance_rescale=g['guidance_rescale'],
+                generator=generator,
+                trajectory_indices=trajectory_indices,
+                extra_call_back_kwargs=extra_call_back_kwargs,
+                ss_resolution=ss_resolution,
+                is_training_stage=is_training,
+                compute_log_prob=compute_log_prob,
+            )
 
         if decode_output:
+            if condition_images is not None:
+                _apply_bg_to_condition_images(
+                    samples, condition_images_rgba=condition_images,
+                    bg_color=render_bg_color,
+                )
             envmap = self._build_envmap(envmap_path)
             samples = [
                 self.render_latents(
                     s,
                     num_frames=render_num_frames,
                     resolution=render_resolution,
+                    bg_color=render_bg_color,
                     envmap=envmap,
                 )
                 for s in samples
@@ -1433,272 +1563,17 @@ class Trellis2Adapter(BaseAdapter):
 
         return samples
 
-    @torch.no_grad()
-    def inference_with_shared_dense(
-        self,
-        prompt: Optional[List[str]] = None,
-        images: Optional[MultiImageBatch] = None,
-        image_cond_512: Optional[List[torch.Tensor]] = None,
-        neg_image_cond_512: Optional[List[torch.Tensor]] = None,
-        image_cond_1024: Optional[List[torch.Tensor]] = None,
-        neg_image_cond_1024: Optional[List[torch.Tensor]] = None,
-        condition_images: Optional[List[List[Image.Image]]] = None,
-        resolution: int = 1024,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        guidance_interval: Tuple[float, float] = (0.0, 1.0),
-        guidance_rescale: float = 0.0,
-        generator: Optional[torch.Generator] = None,
-        compute_log_prob: bool = True,
-        trajectory_indices: TrajectoryIndicesType = 'all',
-        extra_call_back_kwargs: List[str] = [],
-        sampler_params: Dict = None,
-        decode_output: bool = False,
-        render_num_frames: int = 24,
-        render_resolution: int = 512,
-        envmap_path: Optional[str] = None,
-        **kwargs,
-    ) -> List[Trellis2Sample]:
-        """Train shape with shared dense: dense B=1 (pilot), shape+tex B=K.
+    def inference_with_shared_dense(self, **kwargs) -> List[Trellis2Sample]:
+        """Deprecated: delegates to ``inference(training_stage='shape')``."""
+        kwargs.setdefault('stages', ['dense', 'shape', 'tex'])
+        kwargs.setdefault('training_stage', 'shape')
+        return self.inference(**kwargs)
 
-        Runs the dense stage once on a single pilot sample, then copies its
-        outputs (``sparse_coords``, ``dense_*``) to all K samples before
-        running shape (training stage) and tex (downstream for reward) on
-        all K samples independently.
-        """
-        sampler_params = sampler_params or {}
-        resolution = self._as_scalar_resolution(resolution)
-
-        stages_list = ['dense', 'shape', 'tex']
-        cond_512, neg_512, cond_1024, neg_1024, condition_images, batch_size = \
-            self._resolve_conditioning(
-                stages_list, images=images, condition_images=condition_images,
-                image_cond_512=image_cond_512, neg_image_cond_512=neg_image_cond_512,
-                image_cond_1024=image_cond_1024, neg_image_cond_1024=neg_image_cond_1024,
-            )
-
-        ss_resolution = 32 if resolution <= 512 else 64
-        g_dense = self._get_stage_guidance(
-            'dense', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
-        )
-
-        pilot = [Trellis2Sample(
-            condition_images=condition_images[0] if condition_images is not None else None,
-            resolution=resolution,
-        )]
-        self._inference_dense(
-            samples=pilot,
-            image_cond=[cond_512[0]],
-            neg_image_cond=[neg_512[0]],
-            num_inference_steps=num_inference_steps,
-            guidance_scale=g_dense['guidance_scale'],
-            guidance_interval=g_dense['guidance_interval'],
-            guidance_rescale=g_dense['guidance_rescale'],
-            generator=generator,
-            trajectory_indices=trajectory_indices,
-            extra_call_back_kwargs=extra_call_back_kwargs,
-            ss_resolution=ss_resolution,
-            is_training_stage=False,
-            compute_log_prob=False,
-        )
-
-        samples = [
-            Trellis2Sample(
-                condition_images=condition_images[b] if condition_images is not None else None,
-                resolution=resolution,
-                prompt=prompt[b] if prompt else None,
-            )
-            for b in range(batch_size)
-        ]
-        for s in samples:
-            s.sparse_coords = pilot[0].sparse_coords
-            s.dense_final_latent = pilot[0].dense_final_latent
-            s.dense_all_latents = pilot[0].dense_all_latents
-            s.dense_log_probs = pilot[0].dense_log_probs
-            s.dense_image_cond = pilot[0].dense_image_cond
-            s.dense_neg_image_cond = pilot[0].dense_neg_image_cond
-
-        g_shape = self._get_stage_guidance(
-            'shape', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
-        )
-        self._inference_shape(
-            samples=samples,
-            image_cond=cond_1024,
-            neg_image_cond=neg_1024,
-            resolution=resolution,
-            guidance_scale=g_shape['guidance_scale'],
-            guidance_interval=g_shape['guidance_interval'],
-            guidance_rescale=g_shape['guidance_rescale'],
-            generator=generator,
-            trajectory_indices=trajectory_indices,
-            extra_call_back_kwargs=extra_call_back_kwargs,
-            is_training_stage=True,
-            compute_log_prob=compute_log_prob,
-        )
-
-        g_tex = self._get_stage_guidance(
-            'tex', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
-        )
-        self._inference_tex(
-            samples=samples,
-            image_cond=cond_1024,
-            neg_image_cond=neg_1024,
-            resolution=resolution,
-            guidance_scale=g_tex['guidance_scale'],
-            guidance_interval=g_tex['guidance_interval'],
-            guidance_rescale=g_tex['guidance_rescale'],
-            generator=generator,
-            trajectory_indices=trajectory_indices,
-            extra_call_back_kwargs=extra_call_back_kwargs,
-            is_training_stage=False,
-            compute_log_prob=False,
-        )
-
-        if decode_output:
-            envmap = self._build_envmap(envmap_path)
-            samples = [
-                self.render_latents(s, num_frames=render_num_frames,
-                                    resolution=render_resolution, envmap=envmap)
-                for s in samples
-            ]
-
-        return samples
-
-    @torch.no_grad()
-    def inference_with_shared_dense_shape(
-        self,
-        prompt: Optional[List[str]] = None,
-        images: Optional[MultiImageBatch] = None,
-        image_cond_512: Optional[List[torch.Tensor]] = None,
-        neg_image_cond_512: Optional[List[torch.Tensor]] = None,
-        image_cond_1024: Optional[List[torch.Tensor]] = None,
-        neg_image_cond_1024: Optional[List[torch.Tensor]] = None,
-        condition_images: Optional[List[List[Image.Image]]] = None,
-        resolution: int = 1024,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
-        guidance_interval: Tuple[float, float] = (0.0, 1.0),
-        guidance_rescale: float = 0.0,
-        generator: Optional[torch.Generator] = None,
-        compute_log_prob: bool = True,
-        trajectory_indices: TrajectoryIndicesType = 'all',
-        extra_call_back_kwargs: List[str] = [],
-        sampler_params: Dict = None,
-        decode_output: bool = False,
-        render_num_frames: int = 24,
-        render_resolution: int = 512,
-        envmap_path: Optional[str] = None,
-        **kwargs,
-    ) -> List[Trellis2Sample]:
-        """Train tex with shared dense+shape: dense+shape B=1 (pilot), tex B=K.
-
-        Runs dense and shape stages once on a single pilot sample, then
-        copies all upstream outputs to K samples before running tex
-        (training stage) on all K samples independently.
-        """
-        sampler_params = sampler_params or {}
-        resolution = self._as_scalar_resolution(resolution)
-
-        stages_list = ['dense', 'shape', 'tex']
-        cond_512, neg_512, cond_1024, neg_1024, condition_images, batch_size = \
-            self._resolve_conditioning(
-                stages_list, images=images, condition_images=condition_images,
-                image_cond_512=image_cond_512, neg_image_cond_512=neg_image_cond_512,
-                image_cond_1024=image_cond_1024, neg_image_cond_1024=neg_image_cond_1024,
-            )
-
-        ss_resolution = 32 if resolution <= 512 else 64
-
-        pilot = [Trellis2Sample(
-            condition_images=condition_images[0] if condition_images is not None else None,
-            resolution=resolution,
-        )]
-
-        g_dense = self._get_stage_guidance(
-            'dense', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
-        )
-        self._inference_dense(
-            samples=pilot,
-            image_cond=[cond_512[0]],
-            neg_image_cond=[neg_512[0]],
-            num_inference_steps=num_inference_steps,
-            guidance_scale=g_dense['guidance_scale'],
-            guidance_interval=g_dense['guidance_interval'],
-            guidance_rescale=g_dense['guidance_rescale'],
-            generator=generator,
-            trajectory_indices=trajectory_indices,
-            extra_call_back_kwargs=extra_call_back_kwargs,
-            ss_resolution=ss_resolution,
-            is_training_stage=False,
-            compute_log_prob=False,
-        )
-
-        g_shape = self._get_stage_guidance(
-            'shape', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
-        )
-        self._inference_shape(
-            samples=pilot,
-            image_cond=[cond_1024[0]],
-            neg_image_cond=[neg_1024[0]],
-            resolution=resolution,
-            guidance_scale=g_shape['guidance_scale'],
-            guidance_interval=g_shape['guidance_interval'],
-            guidance_rescale=g_shape['guidance_rescale'],
-            generator=generator,
-            trajectory_indices=trajectory_indices,
-            extra_call_back_kwargs=extra_call_back_kwargs,
-            is_training_stage=False,
-            compute_log_prob=False,
-        )
-
-        samples = [
-            Trellis2Sample(
-                condition_images=condition_images[b] if condition_images is not None else None,
-                resolution=resolution,
-                prompt=prompt[b] if prompt else None,
-            )
-            for b in range(batch_size)
-        ]
-        for s in samples:
-            s.sparse_coords = pilot[0].sparse_coords
-            s.dense_final_latent = pilot[0].dense_final_latent
-            s.dense_all_latents = pilot[0].dense_all_latents
-            s.dense_log_probs = pilot[0].dense_log_probs
-            s.dense_image_cond = pilot[0].dense_image_cond
-            s.dense_neg_image_cond = pilot[0].dense_neg_image_cond
-            s.shape_final_latent = pilot[0].shape_final_latent
-            s.shape_all_latents = pilot[0].shape_all_latents
-            s.shape_log_probs = pilot[0].shape_log_probs
-            s.shape_image_cond = pilot[0].shape_image_cond
-            s.shape_neg_image_cond = pilot[0].shape_neg_image_cond
-
-        g_tex = self._get_stage_guidance(
-            'tex', guidance_scale, guidance_interval, guidance_rescale, sampler_params,
-        )
-        self._inference_tex(
-            samples=samples,
-            image_cond=cond_1024,
-            neg_image_cond=neg_1024,
-            resolution=resolution,
-            guidance_scale=g_tex['guidance_scale'],
-            guidance_interval=g_tex['guidance_interval'],
-            guidance_rescale=g_tex['guidance_rescale'],
-            generator=generator,
-            trajectory_indices=trajectory_indices,
-            extra_call_back_kwargs=extra_call_back_kwargs,
-            is_training_stage=True,
-            compute_log_prob=compute_log_prob,
-        )
-
-        if decode_output:
-            envmap = self._build_envmap(envmap_path)
-            samples = [
-                self.render_latents(s, num_frames=render_num_frames,
-                                    resolution=render_resolution, envmap=envmap)
-                for s in samples
-            ]
-
-        return samples
+    def inference_with_shared_dense_shape(self, **kwargs) -> List[Trellis2Sample]:
+        """Deprecated: delegates to ``inference(training_stage='tex')``."""
+        kwargs.setdefault('stages', ['dense', 'shape', 'tex'])
+        kwargs.setdefault('training_stage', 'tex')
+        return self.inference(**kwargs)
 
     def _decode_dense_to_coords(
         self,
@@ -1884,11 +1759,16 @@ class Trellis2Adapter(BaseAdapter):
         is_training_stage: bool = True,
         compute_log_prob: bool = True,
     ) -> None:
-        """Run the shape SLat flow model, one sample at a time.
+        """Run the shape SLat flow model as a single batched pass.
+
+        All samples are merged into one batched ``SparseTensor`` and
+        denoised together, then results are split back per sample.
 
         Requires: ``sample.sparse_coords is not None`` for every sample.
         """
         device = self.device
+        B = len(samples)
+        SparseTensor = self._SparseTensor
         flow_model  = self.pipeline.get_flow_model('shape', resolution)
         in_channels = flow_model.in_channels
 
@@ -1896,91 +1776,117 @@ class Trellis2Adapter(BaseAdapter):
         num_inference_steps = len(scheduler.get_timesteps_for_loop())
         timesteps = scheduler.timesteps
 
+        # ── Batch assembly ──────────────────────────────────────────────
+        # Collect per-sample coords and noise, then merge into a single
+        # batched SparseTensor via from_tensor_list (which offsets batch
+        # indices automatically).  This lets the denoising loop run once
+        # for all B samples instead of looping per sample.
+        coords_list = []
+        noise_list = []
         for b, sample in enumerate(samples):
             if sample.sparse_coords is None:
                 raise ValueError(
                     f"sample[{b}].sparse_coords is None. "
                     "Run the dense stage first or pre-assign coords via the dispatcher."
                 )
-            coords = sample.sparse_coords.to(device)
-            N_b    = coords.shape[0]
-            gen_b = generator[b] if isinstance(generator, list) else generator
-            noise  = torch.randn(N_b, in_channels, generator=gen_b).to(device)  # (N_b, C)
+            coords_b = sample.sparse_coords.to(device)                             # (N_b, 4)
+            noise_b = torch.randn(coords_b.shape[0], in_channels,
+                                  device=device, dtype=torch.float32)              # (N_b, C)
+            coords_list.append(coords_b)
+            noise_list.append(noise_b)
 
-            SparseTensor = self._SparseTensor
-            x_t = SparseTensor(
-                feats=noise.to(dtype=torch.float32),                                  # (N_b, C)
-                coords=coords,                                                        # (N_b, 4)
-            )
+        x_t = SparseTensor.from_tensor_list(noise_list, coords_list)               # batch_size=B
 
-            latent_collector   = create_trajectory_collector(trajectory_indices, num_inference_steps)
-            latent_collector.collect(noise.unsqueeze(0), step_idx=0)
-            callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+        latent_collector   = create_trajectory_collector(trajectory_indices, num_inference_steps)
+        latent_collector.collect(x_t.feats.unsqueeze(0), step_idx=0)               # (1, N_total, C)
+        callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
+        log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
 
-            cond = image_cond[b].to(device=device, dtype=torch.float32).unsqueeze(0)      # (1, seq, D)
-            neg_cond = neg_image_cond[b].to(device=device, dtype=torch.float32).unsqueeze(0)
-            sigma_min = scheduler._sigma_min
+        cond = torch.stack(
+            [c.to(device=device, dtype=torch.float32) for c in image_cond], dim=0,
+        )                                                                          # (B, seq, D)
+        neg_cond = torch.stack(
+            [c.to(device=device, dtype=torch.float32) for c in neg_image_cond], dim=0,
+        )                                                                          # (B, seq, D)
+        sigma_min = scheduler._sigma_min
 
-            for step_idx in scheduler.get_timesteps_for_loop():
-                t_val = scheduler.get_precise_t(step_idx)
-                t_next_val = scheduler.get_precise_t(step_idx + 1)
+        # ── Batched denoising loop ─────────────────────────────────────
+        # All B samples share the same timestep schedule.  _forward_sparse
+        # and scheduler.step both operate on the batched SparseTensor
+        # transparently.  log_prob is reduced from per-point (N_total,) to
+        # per-sample (B,) via _reduce_sparse_log_prob.
+        for step_idx in scheduler.get_timesteps_for_loop():
+            t_val = scheduler.get_precise_t(step_idx)
+            t_next_val = scheduler.get_precise_t(step_idx + 1)
 
-                if self._mode != 'eval':
-                    noise_level_i = scheduler.get_noise_level_for_sigma(t_val)
-                    step_compute_lp = compute_log_prob and (noise_level_i > 0)
-                else:
-                    noise_level_i = 0.0
-                    step_compute_lp = False
+            if self._mode != 'eval':
+                noise_level_i = scheduler.get_noise_level_for_sigma(t_val)
+                step_compute_lp = compute_log_prob and (noise_level_i > 0)
+            else:
+                noise_level_i = 0.0
+                step_compute_lp = False
 
-                pred_pos = self._forward_sparse(t_val, x_t, cond, stage='shape', stage_resolution=resolution)
+            pred_pos = self._forward_sparse(t_val, x_t, cond, stage='shape', stage_resolution=resolution)
 
-                apply_cfg = guidance_interval[0] <= t_val <= guidance_interval[1]
-                if apply_cfg and guidance_scale != 1.0:
-                    pred_neg = self._forward_sparse(t_val, x_t, neg_cond, stage='shape', stage_resolution=resolution)
-                    pred_v = self._apply_cfg_sparse(
-                        pred_pos, pred_neg, x_t, t_val, guidance_scale, guidance_rescale, sigma_min,
-                        batch_size=1,
-                    )
-                else:
-                    pred_v = pred_pos
-
-                output = scheduler.step(
-                    pred_v, t_val, t_next_val, x_t,
-                    generator=gen_b,
-                    noise_level=noise_level_i,
-                    compute_log_prob=step_compute_lp,
+            apply_cfg = guidance_interval[0] <= t_val <= guidance_interval[1]
+            if apply_cfg and guidance_scale != 1.0:
+                pred_neg = self._forward_sparse(t_val, x_t, neg_cond, stage='shape', stage_resolution=resolution)
+                pred_v = self._apply_cfg_sparse(
+                    pred_pos, pred_neg, x_t, t_val, guidance_scale, guidance_rescale, sigma_min,
+                    batch_size=B,
                 )
-                if output.log_prob is not None:
-                    output.log_prob = self._reduce_sparse_log_prob(
-                        output.log_prob, x_t.coords, batch_size=1,
-                    )
+            else:
+                pred_v = pred_pos
 
-                x_t = output.next_latents                                     # SparseTensor
-                latent_collector.collect(x_t.feats.unsqueeze(0), step_idx + 1) # (1, N_b, C)
-                callback_collector.collect_step(step_idx, output, extra_call_back_kwargs)
-                if step_compute_lp and output.log_prob is not None:
-                    log_prob_collector.collect(output.log_prob.detach().unsqueeze(0), step_idx)
+            output = scheduler.step(
+                pred_v, t_val, t_next_val, x_t,
+                noise_level=noise_level_i,
+                compute_log_prob=step_compute_lp,
+            )
+            if output.log_prob is not None:
+                output.log_prob = self._reduce_sparse_log_prob(
+                    output.log_prob, x_t.coords, batch_size=B,
+                )                                                                  # (B,)
 
-            all_latents        = latent_collector.get_result()   # List[(1, N_b, C)]
-            latent_index_map   = latent_collector.get_index_map()
-            extra_callback_res = callback_collector.get_result()
-            callback_index_map = callback_collector.get_index_map()
-            all_log_probs      = log_prob_collector.get_result()
-            log_prob_index_map = log_prob_collector.get_index_map()
+            x_t = output.next_latents                                              # SparseTensor
+            latent_collector.collect(x_t.feats.unsqueeze(0), step_idx + 1)         # (1, N_total, C)
+            callback_collector.collect_step(step_idx, output, extra_call_back_kwargs)
+            if step_compute_lp and output.log_prob is not None:
+                log_prob_collector.collect(output.log_prob.detach().unsqueeze(0), step_idx)  # (1, B)
 
-            shape_latents = (
-                torch.stack([lat[0] for lat in all_latents], dim=0)
-                if all_latents else None
-            )                                                        # (T', N_b, C_shape)
-            shape_log_probs = (
-                torch.stack([lp[0][0] for lp in all_log_probs], dim=0)
-                if all_log_probs else None
-            )                                                        # (T_log,)
+        # ── Result splitting ────────────────────────────────────────────
+        # Collectors accumulated batched data; now split back per sample.
+        # - stacked_latents: (T', N_total, C) → per sample via layout slice
+        # - stacked_log_probs: (T_log, B) → per sample via column index
+        # - extra_callback_res: values indexed by [b] (list/tensor) or
+        #   kept as-is (scalars), following the dense-stage convention.
+        all_latents        = latent_collector.get_result()
+        latent_index_map   = latent_collector.get_index_map()
+        extra_callback_res = callback_collector.get_result()
+        callback_index_map = callback_collector.get_index_map()
+        all_log_probs      = log_prob_collector.get_result()
+        log_prob_index_map = log_prob_collector.get_index_map()
 
-            sample.shape_final_latent        = x_t.feats
-            sample.shape_all_latents         = shape_latents
-            sample.shape_log_probs           = shape_log_probs
+        stacked_latents = (
+            torch.stack([lat[0] for lat in all_latents], dim=0)
+            if all_latents else None
+        )                                                                          # (T', N_total, C)
+        stacked_log_probs = (
+            torch.stack([lp[0] for lp in all_log_probs], dim=0)
+            if all_log_probs else None
+        )                                                                          # (T_log, B)
+
+        feats_list, _ = x_t.to_tensor_list()                                       # List of (N_b, C)
+
+        for b, sample in enumerate(samples):
+            slc = x_t.layout[b]
+            sample.shape_final_latent        = feats_list[b]                       # (N_b, C)
+            sample.shape_all_latents         = (
+                stacked_latents[:, slc, :] if stacked_latents is not None else None
+            )                                                                      # (T', N_b, C)
+            sample.shape_log_probs           = (
+                stacked_log_probs[:, b] if stacked_log_probs is not None else None
+            )                                                                      # (T_log,)
             sample.shape_image_cond          = image_cond[b]
             sample.shape_neg_image_cond      = neg_image_cond[b]
             sample.shape_latent_index_map    = latent_index_map
@@ -1989,7 +1895,8 @@ class Trellis2Adapter(BaseAdapter):
             if is_training_stage:
                 sample.activate_stage('shape')
                 sample.extra_kwargs = {
-                    **{k: v for k, v in extra_callback_res.items()},
+                    **{k: (v[b] if isinstance(v, (list, torch.Tensor)) else v)
+                       for k, v in extra_callback_res.items()},
                     'callback_index_map': callback_index_map,
                 }
 
@@ -2009,17 +1916,28 @@ class Trellis2Adapter(BaseAdapter):
         is_training_stage: bool = True,
         compute_log_prob: bool = True,
     ) -> None:
-        """Run the texture SLat flow model, one sample at a time.
+        """Run the texture SLat flow model as a single batched pass.
 
-        Requires: ``sample.sparse_coords`` and ``sample.shape_all_latents``.
+        Requires: ``sample.sparse_coords`` and ``sample.shape_final_latent``
+        for every sample.
         """
         device = self.device
+        B = len(samples)
+        SparseTensor = self._SparseTensor
         flow_model  = self.pipeline.get_flow_model('tex', resolution)
 
         scheduler = self._get_stage_scheduler('tex')
         num_inference_steps = len(scheduler.get_timesteps_for_loop())
         timesteps = scheduler.timesteps
 
+        # ── Batch assembly ──────────────────────────────────────────────
+        # Same pattern as _inference_shape, plus an extra concat_cond
+        # built from each sample's shape_final_latent.  The concat_cond
+        # SparseTensor shares the same coords/layout as x_t so its feats
+        # can simply be cat-ed in the same order.
+        coords_list = []
+        noise_list = []
+        concat_cond_list = []
         for b, sample in enumerate(samples):
             if sample.sparse_coords is None:
                 raise ValueError(f"sample[{b}].sparse_coords is None.")
@@ -2027,115 +1945,127 @@ class Trellis2Adapter(BaseAdapter):
                 raise ValueError(
                     f"sample[{b}].shape_final_latent is None. Run shape stage first."
                 )
-            coords = sample.sparse_coords.to(device)
-            N_b    = coords.shape[0]
+            coords_b = sample.sparse_coords.to(device)                             # (N_b, 4)
+            tex_concat_cond_b = sample.shape_final_latent.to(
+                device=device, dtype=torch.float32,
+            )                                                                      # (N_b, C_shape)
 
-            tex_concat_cond = sample.shape_final_latent.to(
-                device=device, dtype=torch.float32
-            )                                                          # (N_b, C_shape)
-
-            noise_channels = flow_model.in_channels - tex_concat_cond.shape[-1]
+            noise_channels = flow_model.in_channels - tex_concat_cond_b.shape[-1]
             if noise_channels <= 0:
                 raise ValueError(
                     f"tex flow_model.in_channels ({flow_model.in_channels}) must exceed "
-                    f"tex_concat_cond channels ({tex_concat_cond.shape[-1]})."
+                    f"tex_concat_cond channels ({tex_concat_cond_b.shape[-1]})."
                 )
-            gen_b = generator[b] if isinstance(generator, list) else generator
-            noise = torch.randn(N_b, noise_channels, generator=gen_b).to(device)  # (N_b, C_noise)
+            noise_b = torch.randn(coords_b.shape[0], noise_channels,
+                                  device=device, dtype=torch.float32)              # (N_b, C_noise)
+            coords_list.append(coords_b)
+            noise_list.append(noise_b)
+            concat_cond_list.append(tex_concat_cond_b)
 
-            SparseTensor = self._SparseTensor
-            x_t = SparseTensor(
-                feats=noise.to(dtype=torch.float32),                                  # (N_b, C_noise)
-                coords=coords,                                                        # (N_b, 4)
+        x_t = SparseTensor.from_tensor_list(noise_list, coords_list)               # batch_size=B
+        concat_cond_sparse = x_t.replace(
+            feats=torch.cat(concat_cond_list, dim=0),                              # (N_total, C_shape)
+        )
+
+        latent_collector   = create_trajectory_collector(trajectory_indices, num_inference_steps)
+        latent_collector.collect(x_t.feats.unsqueeze(0), step_idx=0)               # (1, N_total, C_noise)
+        callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
+        log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+
+        cond = torch.stack(
+            [c.to(device=device, dtype=torch.float32) for c in image_cond], dim=0,
+        )                                                                          # (B, seq, D)
+        neg_cond = torch.stack(
+            [c.to(device=device, dtype=torch.float32) for c in neg_image_cond], dim=0,
+        )                                                                          # (B, seq, D)
+        sigma_min = scheduler._sigma_min
+
+        # ── Batched denoising loop ─────────────────────────────────────
+        for step_idx in scheduler.get_timesteps_for_loop():
+            t_val = scheduler.get_precise_t(step_idx)
+            t_next_val = scheduler.get_precise_t(step_idx + 1)
+
+            if self._mode != 'eval':
+                noise_level_i = scheduler.get_noise_level_for_sigma(t_val)
+                step_compute_lp = compute_log_prob and (noise_level_i > 0)
+            else:
+                noise_level_i = 0.0
+                step_compute_lp = False
+
+            pred_pos = self._forward_sparse(
+                t_val, x_t, cond, concat_cond=concat_cond_sparse,
+                stage='tex', stage_resolution=resolution,
             )
-            concat_cond_sparse = x_t.replace(
-                feats=tex_concat_cond,                                                # (N_b, C_shape)
-            )
 
-            latent_collector   = create_trajectory_collector(trajectory_indices, num_inference_steps)
-            latent_collector.collect(noise.unsqueeze(0), step_idx=0)
-            callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
-
-            cond = image_cond[b].to(device=device, dtype=torch.float32).unsqueeze(0)
-            neg_cond = neg_image_cond[b].to(device=device, dtype=torch.float32).unsqueeze(0)
-            sigma_min = scheduler._sigma_min
-
-            for step_idx in scheduler.get_timesteps_for_loop():
-                t_val = scheduler.get_precise_t(step_idx)
-                t_next_val = scheduler.get_precise_t(step_idx + 1)
-
-                if self._mode != 'eval':
-                    noise_level_i = scheduler.get_noise_level_for_sigma(t_val)
-                    step_compute_lp = compute_log_prob and (noise_level_i > 0)
-                else:
-                    noise_level_i = 0.0
-                    step_compute_lp = False
-
-                pred_pos = self._forward_sparse(
-                    t_val, x_t, cond, concat_cond=concat_cond_sparse,
+            apply_cfg = guidance_interval[0] <= t_val <= guidance_interval[1]
+            if apply_cfg and guidance_scale != 1.0:
+                pred_neg = self._forward_sparse(
+                    t_val, x_t, neg_cond, concat_cond=concat_cond_sparse,
                     stage='tex', stage_resolution=resolution,
                 )
-
-                apply_cfg = guidance_interval[0] <= t_val <= guidance_interval[1]
-                if apply_cfg and guidance_scale != 1.0:
-                    pred_neg = self._forward_sparse(
-                        t_val, x_t, neg_cond, concat_cond=concat_cond_sparse,
-                        stage='tex', stage_resolution=resolution,
-                    )
-                    pred_v = self._apply_cfg_sparse(
-                        pred_pos, pred_neg, x_t, t_val, guidance_scale, guidance_rescale, sigma_min,
-                        batch_size=1,
-                    )
-                else:
-                    pred_v = pred_pos
-
-                output = scheduler.step(
-                    pred_v, t_val, t_next_val, x_t,
-                    generator=gen_b,
-                    noise_level=noise_level_i,
-                    compute_log_prob=step_compute_lp,
+                pred_v = self._apply_cfg_sparse(
+                    pred_pos, pred_neg, x_t, t_val, guidance_scale, guidance_rescale, sigma_min,
+                    batch_size=B,
                 )
-                if output.log_prob is not None:
-                    output.log_prob = self._reduce_sparse_log_prob(
-                        output.log_prob, x_t.coords, batch_size=1,
-                    )
+            else:
+                pred_v = pred_pos
 
-                x_t = output.next_latents                                     # SparseTensor
-                latent_collector.collect(x_t.feats.unsqueeze(0), step_idx + 1) # (1, N_b, C_noise)
-                callback_collector.collect_step(step_idx, output, extra_call_back_kwargs)
-                if step_compute_lp and output.log_prob is not None:
-                    log_prob_collector.collect(output.log_prob.detach().unsqueeze(0), step_idx)
+            output = scheduler.step(
+                pred_v, t_val, t_next_val, x_t,
+                noise_level=noise_level_i,
+                compute_log_prob=step_compute_lp,
+            )
+            if output.log_prob is not None:
+                output.log_prob = self._reduce_sparse_log_prob(
+                    output.log_prob, x_t.coords, batch_size=B,
+                )                                                                  # (B,)
 
-            all_latents        = latent_collector.get_result()    # List[(1, N_b, C_noise)]
-            latent_index_map   = latent_collector.get_index_map()
-            extra_callback_res = callback_collector.get_result()
-            callback_index_map = callback_collector.get_index_map()
-            all_log_probs      = log_prob_collector.get_result()
-            log_prob_index_map = log_prob_collector.get_index_map()
+            x_t = output.next_latents                                              # SparseTensor
+            latent_collector.collect(x_t.feats.unsqueeze(0), step_idx + 1)         # (1, N_total, C_noise)
+            callback_collector.collect_step(step_idx, output, extra_call_back_kwargs)
+            if step_compute_lp and output.log_prob is not None:
+                log_prob_collector.collect(output.log_prob.detach().unsqueeze(0), step_idx)  # (1, B)
 
-            tex_latents = (
-                torch.stack([lat[0] for lat in all_latents], dim=0)
-                if all_latents else None
-            )                                                        # (T', N_b, C_noise) or None
-            tex_log_probs = (
-                torch.stack([lp[0][0] for lp in all_log_probs], dim=0)
-                if all_log_probs else None
-            )                                                        # (T_log,) or None
+        # ── Result splitting ────────────────────────────────────────────
+        # Same splitting logic as _inference_shape.
+        all_latents        = latent_collector.get_result()
+        latent_index_map   = latent_collector.get_index_map()
+        extra_callback_res = callback_collector.get_result()
+        callback_index_map = callback_collector.get_index_map()
+        all_log_probs      = log_prob_collector.get_result()
+        log_prob_index_map = log_prob_collector.get_index_map()
 
-            sample.tex_final_latent        = x_t.feats
-            sample.tex_all_latents         = tex_latents
-            sample.tex_log_probs           = tex_log_probs
-            sample.tex_image_cond          = image_cond[b]
-            sample.tex_neg_image_cond      = neg_image_cond[b]
-            sample.tex_concat_cond         = tex_concat_cond
-            sample.tex_latent_index_map    = latent_index_map
-            sample.tex_log_prob_index_map  = log_prob_index_map
-            sample.tex_timesteps           = timesteps
+        stacked_latents = (
+            torch.stack([lat[0] for lat in all_latents], dim=0)
+            if all_latents else None
+        )                                                                          # (T', N_total, C_noise)
+        stacked_log_probs = (
+            torch.stack([lp[0] for lp in all_log_probs], dim=0)
+            if all_log_probs else None
+        )                                                                          # (T_log, B)
+
+        feats_list, _ = x_t.to_tensor_list()                                       # List of (N_b, C_noise)
+
+        for b, sample in enumerate(samples):
+            slc = x_t.layout[b]
+            sample.tex_final_latent          = feats_list[b]                       # (N_b, C_noise)
+            sample.tex_all_latents           = (
+                stacked_latents[:, slc, :] if stacked_latents is not None else None
+            )                                                                      # (T', N_b, C_noise)
+            sample.tex_log_probs             = (
+                stacked_log_probs[:, b] if stacked_log_probs is not None else None
+            )                                                                      # (T_log,)
+            sample.tex_image_cond            = image_cond[b]
+            sample.tex_neg_image_cond        = neg_image_cond[b]
+            sample.tex_concat_cond           = concat_cond_list[b]
+            sample.tex_latent_index_map      = latent_index_map
+            sample.tex_log_prob_index_map    = log_prob_index_map
+            sample.tex_timesteps             = timesteps
             if is_training_stage:
                 sample.activate_stage('tex')
                 sample.extra_kwargs = {
-                    **{k: v for k, v in extra_callback_res.items()},
+                    **{k: (v[b] if isinstance(v, (list, torch.Tensor)) else v)
+                       for k, v in extra_callback_res.items()},
                     'callback_index_map': callback_index_map,
                 }
 
@@ -2294,22 +2224,16 @@ class Trellis2Adapter(BaseAdapter):
         sample = latents
         resolution = kwargs.get('resolution', sample.resolution) or 1024
         
-        # Import MeshWithVoxel from Trellis2
         from trellis2.representations import MeshWithVoxel
-        
-        # 1. Decode shape and get subdivisions
+
         mesh, subs = self.decode_shape(sample, return_subs=True)
-        
         if mesh is None:
             return None
-        
-        # 2. Decode texture if available
+
         tex_voxels = self.decode_texture(sample, subs)
-        
         if tex_voxels is None:
             return mesh
-        
-        # 3. Combine into MeshWithVoxel
+
         mesh.fill_holes()
         
         textured_mesh = MeshWithVoxel(
@@ -2356,6 +2280,7 @@ class Trellis2Adapter(BaseAdapter):
         sample: Trellis2Sample,
         num_frames: int = 24,
         resolution: int = 512,
+        bg_color: Tuple[float, float, float] = (0, 0, 0),
         envmap: Optional[Any] = None,
         envmap_path: Optional[str] = None,
         **render_kwargs,
@@ -2369,6 +2294,7 @@ class Trellis2Adapter(BaseAdapter):
             sample: A ``Trellis2Sample`` with shape + tex latents.
             num_frames: Number of views to render.
             resolution: Render resolution in pixels.
+            bg_color: Background color as ``(R, G, B)`` floats in [0, 1].
             envmap: Pre-built ``EnvMap`` object (avoids repeated disk I/O
                 when called in a loop).
             envmap_path: Path to ``.exr`` HDR file; used only when *envmap*
@@ -2393,24 +2319,27 @@ class Trellis2Adapter(BaseAdapter):
         _FOV_DEG    = 40.0
         _PITCH_DEG  = 20.0
         _FILL_RATIO = 0.9
+        _START_YAW  = np.pi  # front-facing view first (180° from default)
         r = _compute_adaptive_distance(_FOV_DEG, fill_ratio=_FILL_RATIO)
-        yaws_rad   = torch.linspace(0, 2 * np.pi, num_frames + 1)[:-1].tolist()
+        yaws_rad   = torch.linspace(
+            _START_YAW, _START_YAW + 2 * np.pi, num_frames + 1,
+        )[:-1].tolist()
         pitchs_rad = [np.deg2rad(_PITCH_DEG)] * num_frames
         extrinsics, intrinsics = render_utils.yaw_pitch_r_fov_to_extrinsics_intrinsics(
             yaws_rad, pitchs_rad, r, _FOV_DEG,
         )
         ret = render_utils.render_frames(
             mesh, extrinsics, intrinsics,
-            {'resolution': resolution, 'bg_color': (0, 0, 0)},
+            {'resolution': resolution, 'bg_color': bg_color},
             envmap=envmap,
             verbose=render_kwargs.pop('verbose', False),
             **render_kwargs,
         )
-        color_list = ret['shaded']
-
-        frames_np = np.stack(color_list)                       # (T, H, W, C) uint8
-        frames = torch.from_numpy(frames_np).float() / 255.0  # (T, H, W, C) float32 [0,1]
-        frames = frames.permute(0, 3, 1, 2)                   # (T, C, H, W) float32
+        shaded = np.stack(ret['shaded']).astype(np.float32) / 255.0  # (T, H, W, 3)
+        alpha = np.stack(ret['alpha'])[..., :1].astype(np.float32) / 255.0  # (T, H, W, 1)
+        bg = np.float32(bg_color).reshape(1, 1, 1, 3)            # (1, 1, 1, 3)
+        frames = np.clip(shaded + bg * (1 - alpha), 0, 1)        # (T, H, W, 3)
+        frames = torch.from_numpy(frames).permute(0, 3, 1, 2)    # (T, C, H, W) float32
 
         sample.video = frames
         return sample

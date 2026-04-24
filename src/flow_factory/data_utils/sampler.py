@@ -143,3 +143,89 @@ class GroupContiguousSampler(Sampler):
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+
+
+class DistributedGroupAlignedSampler(Sampler):
+    """Distributed sampler that scatters K copies across ranks within one
+    global iteration for load balancing, while guaranteeing that all K
+    copies of each prompt appear in the same iteration (enabling cross-GPU
+    upstream stage sharing without cross-iteration caches).
+
+    Constraint: ``num_replicas * batch_size`` must be divisible by
+    ``group_size`` so that an integer number of complete groups fits in
+    one global iteration.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        group_size: int,
+        unique_sample_num: int,
+        num_replicas: int,
+        rank: int,
+        seed: int = 0,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.k = group_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.m = unique_sample_num
+
+        if unique_sample_num > len(self.dataset):
+            raise ValueError(
+                f"unique_sample_num ({unique_sample_num}) must be "
+                f"<= dataset size ({len(self.dataset)})."
+            )
+
+        S = num_replicas * batch_size
+        if S % self.k != 0:
+            raise ValueError(
+                f"global iteration size W*B ({S}) must be divisible by "
+                f"group_size ({self.k}) for DistributedGroupAlignedSampler."
+            )
+
+        self.groups_per_iter = S // self.k
+
+        step = self.groups_per_iter
+        new_m = (self.m + step - 1) // step * step
+        if new_m != self.m:
+            logger.warning(
+                f"DistributedGroupAlignedSampler: adjusted unique_sample_num "
+                f"from {self.m} to {new_m} so it is a multiple of "
+                f"groups_per_iter ({step})."
+            )
+            self.m = new_m
+
+        self.sample_num_per_iteration = S
+        self.num_batches_per_epoch = (self.m * self.k) // S
+        self.epoch = 0
+
+    def __iter__(self):
+        while True:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+
+            indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()
+            group_perm = torch.randperm(self.m, generator=g).tolist()
+            shuffled_groups = [indices[i] for i in group_perm]
+
+            for iter_idx in range(self.m // self.groups_per_iter):
+                start_g = iter_idx * self.groups_per_iter
+                iter_groups = shuffled_groups[start_g: start_g + self.groups_per_iter]
+
+                iter_samples = [gidx for gidx in iter_groups for _ in range(self.k)]
+
+                perm = torch.randperm(len(iter_samples), generator=g).tolist()
+                shuffled = [iter_samples[p] for p in perm]
+
+                start = self.rank * self.batch_size
+                end = start + self.batch_size
+                yield shuffled[start:end]
+
+            self.epoch += 1
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch

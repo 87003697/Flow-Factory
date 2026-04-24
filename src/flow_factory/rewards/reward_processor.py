@@ -21,9 +21,12 @@ from typing import Dict, Any, Optional, List, Tuple, Set, Union, Literal
 from collections import defaultdict
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, Future
+import logging
 import torch
 import numpy as np
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 from accelerate import Accelerator
 

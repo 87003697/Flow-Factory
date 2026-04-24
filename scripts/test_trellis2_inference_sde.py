@@ -1,23 +1,24 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Render comparison test for Trellis2Adapter: Official ODE vs Local ODE.
+Render comparison test for Trellis2Adapter: Official ODE vs Local SDE rollout.
 
 Paths:
     A  Official ODE  (Trellis2ImageTo3DPipeline.run)
-    B  Local   ODE   (adapter.eval, all stages ODE)
+    B  Local   SDE   (adapter.rollout, all stages SDE)
 
 Flow:
-    Phase 1: Path A — official pipeline inference → render → save A.pt → release
+    Phase 1: Path A — official pipeline ODE inference → render → save A.pt → release
     Phase 2: Load adapter, precompute image conditioning
-    Phase 3: Path B — adapter ODE inference → render → save B.pt → release
-    Phase 4: CPU only — load A/B.pt → comparison grid + numerical diff
+    Phase 3: Path B — adapter SDE rollout inference → render → save B_sde.pt → release
+    Phase 4: CPU only — load A/B_sde.pt → comparison grid + numerical diff + log_prob stats
 
 Usage:
     conda activate grpo3d_trellis2
     cd Flow-Factory
-    python scripts/test_trellis2_inference.py
+    python scripts/test_trellis2_inference_sde.py
 """
+import argparse
 import os
 import sys
 import gc
@@ -135,7 +136,7 @@ def make_comparison_image(tensors: dict, num_views: int = 6) -> Image.Image:
 
 # ──────────────────── config / setup ─────────────────────────────
 
-def create_test_config() -> Arguments:
+def create_test_config(noise_level: float = 0.7, num_sde_steps: int = 1) -> Arguments:
     model_args = ModelArguments(
         model_name_or_path=LOCAL_MODEL_PATH,
         model_type="trellis2",
@@ -155,13 +156,16 @@ def create_test_config() -> Arguments:
         model_args=model_args,
         training_args=training_args,
         eval_args=EvaluationArguments(),
-        scheduler_args=SchedulerArguments(),
+        scheduler_args=SchedulerArguments(
+            noise_level=noise_level,
+            num_sde_steps=num_sde_steps,
+        ),
         mixed_precision="bf16",
     )
 
 
-def setup_adapter():
-    config = create_test_config()
+def setup_adapter(noise_level: float = 0.7, num_sde_steps: int = 1):
+    config = create_test_config(noise_level=noise_level, num_sde_steps=num_sde_steps)
     accelerator = Accelerator(mixed_precision=config.mixed_precision)
     print("[setup] Loading Trellis2Adapter ...")
     adapter = Trellis2Adapter(config=config, accelerator=accelerator)
@@ -173,53 +177,76 @@ def setup_adapter():
 # ──────────────────────── main ───────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--noise_level", type=float, default=0.7,
+                        help="SDE noise level (default: 0.7)")
+    parser.add_argument("--num_sde_steps", type=int, default=1,
+                        help="Number of SDE steps per rollout (default: 1)")
+    parser.add_argument("--skip_path_a", action="store_true",
+                        help="Skip Path A (official ODE) if A.pt already exists")
+    args = parser.parse_args()
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     image = Image.open(TEST_IMAGE_PATH)
     assert image is not None, f"Test image not found: {TEST_IMAGE_PATH}"
     t0 = time.time()
 
+    nl_tag = f"nl{args.noise_level:g}_ns{args.num_sde_steps}"  # e.g. nl1.5_ns1
+    sde_pt_name = f"B_sde_{nl_tag}.pt"
+    sde_comp_name = f"render_comparison_sde_{nl_tag}.png"
+
+    a_pt_path = os.path.join(OUTPUT_DIR, "A.pt")
+    skip_a = args.skip_path_a and os.path.exists(a_pt_path)
+
     # ═══════════════ Phase 1: Path A (official pipeline) ═════════
-    print("\n" + "=" * 60)
-    print("PATH A: Official ODE (Trellis2ImageTo3DPipeline.run)")
-    print("=" * 60)
+    if skip_a:
+        print(f"\n[Phase 1 SKIPPED — A.pt already exists at {a_pt_path}]")
+    else:
+        print("\n" + "=" * 60)
+        print("PATH A: Official ODE (Trellis2ImageTo3DPipeline.run)")
+        print("=" * 60)
 
-    from trellis2.pipelines import Trellis2ImageTo3DPipeline
-    from trellis2.modules import image_feature_extractor
-    import o_voxel  # noqa: F401
+        from trellis2.pipelines import Trellis2ImageTo3DPipeline
+        from trellis2.modules import image_feature_extractor
+        import o_voxel  # noqa: F401
 
-    local_dinov3 = os.path.join(
-        project_root,
-        "pretrained_weights/dinov3-vitl16-pretrain-lvd1689m/"
-        "facebook/dinov3-vitl16-pretrain-lvd1689m",
-    )
-    _orig_init = image_feature_extractor.DinoV3FeatureExtractor.__init__
-    def _patched_init(self, model_name: str, image_size=512):
-        _orig_init(self, local_dinov3, image_size)
-    image_feature_extractor.DinoV3FeatureExtractor.__init__ = _patched_init
-    pipeline = Trellis2ImageTo3DPipeline.from_pretrained(LOCAL_MODEL_PATH)
-    image_feature_extractor.DinoV3FeatureExtractor.__init__ = _orig_init
-    pipeline.cuda()
+        local_dinov3 = os.path.join(
+            project_root,
+            "pretrained_weights/dinov3-vitl16-pretrain-lvd1689m/"
+            "facebook/dinov3-vitl16-pretrain-lvd1689m",
+        )
+        _orig_init = image_feature_extractor.DinoV3FeatureExtractor.__init__
+        def _patched_init(self, model_name: str, image_size=512):
+            _orig_init(self, local_dinov3, image_size)
+        image_feature_extractor.DinoV3FeatureExtractor.__init__ = _patched_init
+        pipeline = Trellis2ImageTo3DPipeline.from_pretrained(LOCAL_MODEL_PATH)
+        image_feature_extractor.DinoV3FeatureExtractor.__init__ = _orig_init
+        pipeline.cuda()
 
-    torch.manual_seed(_SEED)
-    mesh_a = pipeline.run(image, seed=_SEED, pipeline_type='1024')[0]
-    mesh_a.simplify(16777216)
-    print(f"  Mesh: {mesh_a.vertices.shape[0]} verts, {mesh_a.faces.shape[0]} faces")
+        torch.manual_seed(_SEED)
+        mesh_a = pipeline.run(image, seed=_SEED, pipeline_type='1024')[0]
+        mesh_a.simplify(16777216)
+        print(f"  Mesh: {mesh_a.vertices.shape[0]} verts, {mesh_a.faces.shape[0]} faces")
 
-    envmap_a = build_envmap("cuda")
-    video_a = render_mesh(mesh_a, envmap_a)
-    torch.save(video_a.cpu(), os.path.join(OUTPUT_DIR, "A.pt"))
-    print(f"  video: {video_a.shape}  [{time.time()-t0:.0f}s]")
+        envmap_a = build_envmap("cuda")
+        video_a = render_mesh(mesh_a, envmap_a)
+        torch.save(video_a.cpu(), a_pt_path)
+        print(f"  video: {video_a.shape}  [{time.time()-t0:.0f}s]")
 
-    del pipeline, mesh_a, envmap_a, video_a
-    gc.collect()
-    torch.cuda.empty_cache()
+        del pipeline, mesh_a, envmap_a, video_a
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # ═══════════════ Phase 2: Load adapter + precompute cond ═════
     print("\n" + "=" * 60)
-    print("Phase 2: Load adapter + precompute image conditioning")
+    print(f"Phase 2: Load adapter + precompute image conditioning"
+          f"  (noise_level={args.noise_level}, num_sde_steps={args.num_sde_steps})")
     print("=" * 60)
 
-    adapter, image = setup_adapter()
+    adapter, image = setup_adapter(
+        noise_level=args.noise_level,
+        num_sde_steps=args.num_sde_steps,
+    )
 
     print("[preprocess] Encoding image conditioning (512 + 1024) ...")
     encoded = adapter.preprocess_func(images=[[image]])
@@ -230,13 +257,22 @@ def main():
 
     envmap = adapter._build_envmap()
 
-    # ═══════════════ Phase 3: Path B (Local ODE) ═════════════════
+    # ═══════════════ Phase 3: Path B (Local SDE rollout) ═════════
     print(f"\n{'=' * 60}")
-    print("PATH B: Local full ODE (adapter.eval)")
+    print(f"PATH B: Local SDE rollout (adapter.rollout)  [{nl_tag}]")
     print("=" * 60)
 
     torch.manual_seed(_SEED)
-    adapter.eval()
+    adapter.rollout()
+
+    # Report which steps will actually be SDE for each stage
+    for stage_name, sched in [
+        ('dense', adapter.pipeline.scheduler_dense),
+        ('shape', adapter.pipeline.scheduler_shape),
+        ('tex',   adapter.pipeline.scheduler_tex),
+    ]:
+        print(f"  [{stage_name}] sde_steps={sched.current_sde_steps.tolist()}, "
+              f"num={sched.num_sde_steps}, noise_level={sched.noise_level}")
 
     for stage, res in [('dense', 1024), ('shape', 1024), ('tex', 1024)]:
         adapter.pipeline.get_flow_model(stage, res).to(adapter.device)
@@ -254,11 +290,25 @@ def main():
             neg_image_cond_1024=encoded['neg_image_cond_1024'],
             condition_images=encoded.get('condition_images'),
             stages=["dense", "shape", "tex"],
-            compute_log_prob=False,
+            compute_log_prob=True,
             decode_output=False,
         )[0]
         print(f"  inference done  [{time.time()-t_path:.0f}s]")
         print(f"  coords: {sample.sparse_coords.shape[0]}")
+
+        # Log log_prob statistics for each stage
+        for stage_name, lp_field in [
+            ("dense", "dense_log_probs"),
+            ("shape", "shape_log_probs"),
+            ("tex",   "tex_log_probs"),
+        ]:
+            lp = getattr(sample, lp_field, None)
+            if lp is not None:
+                print(f"  {stage_name} log_prob: mean={lp.mean():.4f}, min={lp.min():.4f}, "
+                      f"max={lp.max():.4f}, has_nan={lp.isnan().any()}, has_inf={lp.isinf().any()}, "
+                      f"shape={tuple(lp.shape)}")
+            else:
+                print(f"  {stage_name} log_prob: None")
 
         t_render = time.time()
         try:
@@ -273,8 +323,9 @@ def main():
             torch.cuda.empty_cache()
             sample.video = None
 
+    sde_pt_path = os.path.join(OUTPUT_DIR, sde_pt_name)
     if sample.video is not None:
-        torch.save(sample.video.cpu(), os.path.join(OUTPUT_DIR, "B.pt"))
+        torch.save(sample.video.cpu(), sde_pt_path)
         print(f"  render done  video={sample.video.shape}  [{time.time()-t_render:.0f}s]")
     else:
         print(f"  render SKIPPED (OOM)  [{time.time()-t_render:.0f}s]")
@@ -286,26 +337,28 @@ def main():
 
     # ═══════════════ Phase 4: Comparison (CPU only) ═══════════════
     print("\n" + "=" * 60)
-    print("Phase 4: Comparison image + numerical diff")
+    print(f"Phase 4: Comparison — Official ODE vs Local SDE ({nl_tag})")
     print("=" * 60)
 
     all_videos = {}
-    for name, label in [("A", "A (Official ODE)"), ("B", "B (Local ODE)")]:
-        pt_path = os.path.join(OUTPUT_DIR, f"{name}.pt")
+    ode_label = "A (Official ODE)"
+    sde_label = f"B (Local SDE, {nl_tag})"
+    for pt_path, label in [(a_pt_path, ode_label), (sde_pt_path, sde_label)]:
         if os.path.exists(pt_path):
             all_videos[label] = torch.load(pt_path, weights_only=True)
         else:
-            print(f"  {name}: .pt not found, skipping")
+            print(f"  {os.path.basename(pt_path)}: not found, skipping")
 
     if len(all_videos) == 2:
         comp = make_comparison_image(all_videos)
-        comp.save(os.path.join(OUTPUT_DIR, "render_comparison.png"))
-        print(f"Comparison image saved to {OUTPUT_DIR}/render_comparison.png")
+        comp_path = os.path.join(OUTPUT_DIR, sde_comp_name)
+        comp.save(comp_path)
+        print(f"Comparison image saved to {comp_path}")
 
-        ref = all_videos["A (Official ODE)"]
-        local = all_videos["B (Local ODE)"]
+        ref = all_videos[ode_label]
+        local = all_videos[sde_label]
         diff = (local - ref).abs()                         # (T, C, H, W)
-        print(f"  B vs A — mean_abs_diff={diff.mean():.4f}, max={diff.max():.4f}")
+        print(f"  B_sde[{nl_tag}] vs A — mean_abs_diff={diff.mean():.4f}, max={diff.max():.4f}")
     else:
         print("  Not enough results for comparison")
 
