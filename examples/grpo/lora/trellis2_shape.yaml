@@ -64,7 +64,9 @@ train:
   # Sampling settings
   resolution: 1024  # Trellis2 shape/tex conditioning resolution
   num_inference_steps: 12  # Number of timesteps (Trellis2 typically uses 12)
-  guidance_scale: 7.5  # Guidance scale for sampling
+  # NOTE: Trellis2 reads CFG (guidance_strength / interval / rescale) from
+  # pretrained_weights/TRELLIS.2-4B/pipeline.json's *_slat_sampler.params,
+  # so train.guidance_scale is intentionally omitted here.
 
   # Batch and sampling
   per_device_batch_size: 2  # Batch size per device (must divide group_size)
@@ -96,7 +98,7 @@ train:
 # Scheduler Configuration (global defaults, overridden per-stage via model.{stage}_sde)
 scheduler:
   dynamics_type: "Flow-SDE"  # FlowGRPO SDE for the training stage (shape)
-  noise_level: 0.7  # Noise level for SDE sampling
+  noise_level: 1.0  # Noise level for SDE sampling
   num_sde_steps: 1  # Number of SDE noise steps per rollout (1 of 12 steps is stochastic)
   sde_steps: [1, 2, 3]  # Eligible timestep indices for SDE noise injection
   seed: 42  # Scheduler seed (for noise step selection)
@@ -105,7 +107,7 @@ scheduler:
 eval:
   resolution: 1024  # Evaluation resolution
   per_device_batch_size: 1  # Eval batch size
-  guidance_scale: 7.5  # Guidance scale for sampling
+  # NOTE: eval.guidance_scale intentionally omitted — see train block above.
   num_inference_steps: 12  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs
   seed: 42  # Eval seed (defaults to training seed)
@@ -118,6 +120,8 @@ rewards:
     batch_size: 8
     device: "cuda"
     dtype: bfloat16
+    async_reward: true
+    num_workers: 1
 
 # Optional Evaluation Reward Models
 eval_rewards:
@@ -126,3 +130,5 @@ eval_rewards:
   batch_size: 8
   device: "cuda"
   dtype: bfloat16
+  async_reward: true
+  num_workers: 1

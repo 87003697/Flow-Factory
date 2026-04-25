@@ -257,19 +257,12 @@ class Trellis2GRPOTrainer(GRPOTrainer):
             for stage in self._upstream_stages:
                 cond_key = 'image_cond_512' if stage == 'dense' else 'image_cond_1024'
                 neg_key = 'neg_image_cond_512' if stage == 'dense' else 'neg_image_cond_1024'
-                g = self.adapter._get_stage_guidance(
-                    stage,
-                    self.training_args.guidance_scale,
-                )
                 self.adapter._run_stage_inference(
                     stage, pilot,
                     image_cond=[merged_batch[cond_key][local_idx]],
                     neg_image_cond=[merged_batch[neg_key][local_idx]],
                     resolution=resolution,
                     num_inference_steps=self.training_args.num_inference_steps,
-                    guidance_scale=g['guidance_scale'],
-                    guidance_interval=g['guidance_interval'],
-                    guidance_rescale=g['guidance_rescale'],
                     generator=None,
                     trajectory_indices=trajectory_indices,
                     extra_call_back_kwargs=[],
