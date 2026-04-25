@@ -361,8 +361,6 @@ class Trellis2Adapter(BaseAdapter):
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: Trellis2PseudoPipeline
-        
-        self._SparseTensor = SparseTensor
     
     # Mapping for special model directory names
     _LOCAL_MODEL_DIR_MAP = {
@@ -1036,8 +1034,6 @@ class Trellis2Adapter(BaseAdapter):
 
         Returns dict with keys ``x_t``, ``next_latents``, ``concat_cond``.
         """
-        SparseTensor = self._SparseTensor
-
         if isinstance(latents, SparseTensor):
             assert next_latents is None or isinstance(next_latents, SparseTensor)
             assert tex_concat_cond is None or isinstance(tex_concat_cond, SparseTensor)
@@ -1766,7 +1762,6 @@ class Trellis2Adapter(BaseAdapter):
         """
         device = self.device
         B = len(samples)
-        SparseTensor = self._SparseTensor
         flow_model  = self.pipeline.get_flow_model('shape', resolution)
         in_channels = flow_model.in_channels
 
@@ -1921,7 +1916,6 @@ class Trellis2Adapter(BaseAdapter):
         """
         device = self.device
         B = len(samples)
-        SparseTensor = self._SparseTensor
         flow_model  = self.pipeline.get_flow_model('tex', resolution)
 
         scheduler = self._get_stage_scheduler('tex')
@@ -2124,7 +2118,6 @@ class Trellis2Adapter(BaseAdapter):
         Returns:
             Mesh object, or (mesh, subs) if return_subs=True
         """
-        SparseTensor = self._SparseTensor
         device = self.device
         
         features = self._get_denormalized_features(sample, 'shape')
@@ -2192,8 +2185,7 @@ class Trellis2Adapter(BaseAdapter):
         coords = sample.sparse_coords
         if coords is None:
             return None
-        
-        SparseTensor = self._SparseTensor
+
         device = self.device
         
         decoder = self.pipeline.tex_decoder
