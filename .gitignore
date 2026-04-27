@@ -101,11 +101,40 @@ latest_checkpointed_iteration.txt
 .claude/CLAUDE.md
 
 # ====================
+# Agent local notes & scratch (personal session logs, not project-level skills)
+# ====================
+.agents/sessions/
+.scratch/
+
+# ====================
+# Local-only artifacts (reference code, third-party checkouts, scratch CSVs)
+# ====================
+_reference_codes/
+third_party/
+captions.csv
+
+# ====================
+# Personal dev scripts (per-user debug / download utilities)
+# ====================
+scripts/debug/
+scripts/download/
+
+# ====================
+# Local pretrained weight symlink / dir
+# ====================
+pretrained_weights
+pretrained_weights/
+
+# ====================
 # Dataset assets (keep metadata, ignore media)
 # ====================
 
 # gitattributes in dataset
 dataset/**/.gitattributes
+
+# Local trellis2 datasets (large, not project-tracked)
+dataset/trellis2/
+dataset/trellis2_debug/
 
 # Image data
 dataset/**/image/
