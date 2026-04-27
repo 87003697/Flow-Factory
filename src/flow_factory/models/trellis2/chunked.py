@@ -376,23 +376,30 @@ class ChunkableSparseTensor:
         # ★ 按坐标规范排序，消除 chunk 边界对点顺序的影响。
         # 这保证了不同 chunk_size 产生相同的输出顺序，
         # 使 gradient checkpoint recompute 时 grad_output 与 recomputed output 对齐。
-        D = merged_coords[:, 1:].max().item() + 1  # 坐标维度上界
-        sort_key = (merged_coords[:, 0] * (D ** 3) +
-                    merged_coords[:, 1] * (D ** 2) +
-                    merged_coords[:, 2] * D +
-                    merged_coords[:, 3])            # (N,)
-        sort_idx = sort_key.argsort()               # (N,)
-        del sort_key                                # 释放 sort_key（N,）int64
+        #
+        # 推理路径（@torch.no_grad()）下 ckpt 不会触发，规范排序纯粹浪费 ~2× feats
+        # 显存峰值（old_feats + old_feats[sort_idx] 同时驻留）。下游消费方
+        # （后续 SparseConv 层、_align_guide_sub、flexible_dual_grid_to_mesh、
+        # MeshWithVoxel 构造）均按 (coord, feat) 配对处理，不依赖行顺序，
+        # 因此 grad 关闭时直接跳过排序，省掉 (N, C) 的峰值分配。
+        if torch.is_grad_enabled():
+            D = merged_coords[:, 1:].max().item() + 1  # 坐标维度上界
+            sort_key = (merged_coords[:, 0] * (D ** 3) +
+                        merged_coords[:, 1] * (D ** 2) +
+                        merged_coords[:, 2] * D +
+                        merged_coords[:, 3])            # (N,)
+            sort_idx = sort_key.argsort()               # (N,)
+            del sort_key                                # 释放 sort_key（N,）int64
 
-        # 分步排序：先排 coords（小），释放旧 coords，再排 feats（大），
-        # 避免 old_feats + new_feats 同时存在时的峰值显存
-        merged_coords = merged_coords[sort_idx]     # (N, 4)
-        old_feats = merged_feats
-        del merged_feats
-        torch.cuda.empty_cache()                    # 回收旧 merged_feats + 碎片
-        merged_feats = old_feats[sort_idx]          # (N, C)
-        del old_feats, sort_idx
-        
+            # 分步排序：先排 coords（小），释放旧 coords，再排 feats（大），
+            # 避免 old_feats + new_feats 同时存在时的峰值显存
+            merged_coords = merged_coords[sort_idx]     # (N, 4)
+            old_feats = merged_feats
+            del merged_feats
+            torch.cuda.empty_cache()                    # 回收旧 merged_feats + 碎片
+            merged_feats = old_feats[sort_idx]          # (N, C)
+            del old_feats, sort_idx
+
         return SparseTensor(merged_feats, merged_coords, scale=merged_scale)  # SparseTensor feats: (N, C)
     
     def apply(self, func: Callable[[Chunk], SparseTensor]) -> SparseTensor:
