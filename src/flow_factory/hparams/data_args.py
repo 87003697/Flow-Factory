@@ -26,6 +26,10 @@ class DataArguments(ArgABC):
         default="data",
         metadata={"help": "Path to the folder containing the datasets."},
     )
+    cache_dir: str = field(
+        default="~/.cache/flow_factory/datasets",
+        metadata={"help": "Directory for caching preprocessed datasets (fingerprinted by content hash)."},
+    )
     image_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the folder containing conditioning images. Defaults to 'images' subfolder in dataset_dir."},
@@ -33,6 +37,10 @@ class DataArguments(ArgABC):
     video_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the folder containing conditioning videos. Defaults to 'videos' subfolder in dataset_dir."},
+    )
+    audio_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the folder containing audio files. Defaults to 'audios' subfolder in dataset_dir."},
     )
     preprocessing_batch_size: int = field(
         default=8,
@@ -76,7 +84,11 @@ class DataArguments(ArgABC):
         },
     )
     sampler_type: Literal[
-        "auto", "distributed_k_repeat", "group_contiguous", "distributed_group_aligned"
+        "auto",
+        "distributed_k_repeat",
+        "group_contiguous",
+        "group_distributed",
+        "distributed_group_aligned",
     ] = field(
         default="auto",
         metadata={
@@ -89,9 +101,17 @@ class DataArguments(ArgABC):
                 "(fewer constraints, extra all-gather communication). "
                 "'group_contiguous': keep all K copies of each group on the same rank "
                 "(requires unique_sample_num divisible by world_size). "
-                "'distributed_group_aligned': scatter K copies across ranks within "
-                "the same global iteration for load-balanced cross-GPU upstream "
-                "sharing (requires W*B divisible by group_size)."
+                "'group_distributed': split each group evenly across ranks "
+                "(requires group_size divisible by world_size and exact global batch tiling); "
+                "every rank sees the same prompt sequence (DGPO invariant). "
+                "'distributed_group_aligned': scatter K copies across ranks for "
+                "load balancing while keeping all K copies of each prompt within "
+                "one global iteration; only requires "
+                "(num_replicas * batch_size) % group_size == 0 (supports K < W). "
+                "For DGPO trainer, sampler_type is always resolved to 'group_distributed'. "
+                "Trellis2 cross-GPU upstream sharing uses 'distributed_group_aligned' "
+                "by default to keep K copies of each prompt within the same global iteration "
+                "without the K % W == 0 constraint."
             )
         },
     )

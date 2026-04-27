@@ -1,0 +1,134 @@
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: null  # Path to distributed config file (optional)
+num_processes: 7  # Number of processes to launch (overrides config file)
+main_process_port: 29500
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/trellis2"  # Path to dataset folder (RGBA images + prompts)
+  preprocessing_batch_size: 4  # Batch size for preprocessing
+  dataloader_num_workers: 8  # Number of workers for DataLoader
+  force_reprocess: false  # Force reprocessing of the dataset
+  cache_dir: "/data/zhiyuan_ma/.cache/flow_factory/datasets"  # Cache on /data (2.8T free)
+  max_dataset_size: null  # No limit for production training
+  dataset_type: "image_3d"  # Use Image3DDataset to load RGBA images (alpha = foreground mask)
+  sampler_type: "distributed_group_aligned"  # Scatter K copies of each prompt across ranks within one global iteration (load-balanced); enables Trellis2 cross-GPU upstream stage sharing without requiring K % W == 0
+
+# Model Configuration
+model:
+  finetune_type: 'lora'  # Options: full, lora
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"  # Options: all, default, or list of module names
+  model_name_or_path: "pretrained_weights/TRELLIS.2-4B"  # Local path to TRELLIS.2 4B model
+  model_type: "trellis2"
+  resume_path: null  # Path to load previous checkpoint/lora adapter
+  resume_type: null  # Options: lora, full, state. Null to auto-detect based on `finetune_type`
+  # Trellis2-specific
+  target_flow_model: "shape_slat_1024"  # Options: dense, shape_slat_1024, shape_slat_512, tex_slat_1024, tex_slat_512
+  decode_output: true  # Decode latents to mesh and render multiview frames for reward
+  render_num_frames: 24  # Number of views to render per sample
+  render_resolution: 512  # Render resolution in pixels
+  render_bg_color: [1, 1, 1]  # Render background color (RGB, 0-1 float)
+  envmap_path: null  # Path to .exr HDR envmap file (null for default)
+  # Per-stage SDE overrides (consumed by Trellis2Adapter._stage_sde_kwargs)
+  # Shape stage inherits global Flow-SDE defaults — no override needed.
+  dense_sde:
+    dynamics_type: "ODE"  # Dense stage uses deterministic ODE (not trained)
+  tex_sde:
+    dynamics_type: "ODE"  # Tex stage uses deterministic ODE (downstream for reward only)
+
+log:
+  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  project: "Flow-Factory"  # Project name for logging
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
+  save_freq: 20  # Save frequency in epochs (0 to disable)
+  save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
+
+# Training Configuration
+train:
+  # Trainer settings
+  trainer_type: 'trellis2_grpo'  # Trellis2 GRPO with upstream stage sharing
+  advantage_aggregation: 'gdpo'  # Options: 'sum', 'gdpo'
+  # Clipping
+  clip_range: 1.0e-4  # PPO/GRPO clipping range
+  adv_clip_range: 5.0  # Advantage clipping range
+  # KL div
+  kl_type: 'v-based'  # Options: 'x-based', 'v-based'
+  kl_beta: 0  # KL divergence coefficient. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
+  ref_param_device: 'cuda'  # Options: cpu, cuda
+
+  # Sampling settings
+  resolution: 1024  # Trellis2 shape/tex conditioning resolution
+  num_inference_steps: 12  # Number of timesteps (Trellis2 typically uses 12)
+  # NOTE: Trellis2 reads CFG (guidance_strength / interval / rescale) from
+  # pretrained_weights/TRELLIS.2-4B/pipeline.json's *_slat_sampler.params,
+  # so train.guidance_scale is intentionally omitted here.
+
+  # Batch and sampling
+  per_device_batch_size: 2  # Batch size per device (must divide group_size)
+  group_size: 14  # K=14: W*B=14 copies per prompt across 7 GPUs
+  global_std: false  # Use global std for advantage normalization
+  max_epochs: 200  # Total training epochs
+  unique_sample_num_per_epoch: 4  # 4 unique prompts × K=14 = 56 samples/epoch
+  gradient_step_per_epoch: 4  # Gradient steps per epoch
+  gradient_accumulation_steps: 1  # M=4 batches / 4 gradient_steps = 1
+
+  # Optimizer
+  learning_rate: 1.0e-4  # Initial learning rate
+  adam_weight_decay: 1.0e-4  # AdamW weight decay
+  adam_betas: [0.9, 0.999]  # AdamW betas
+  adam_epsilon: 1.0e-8  # AdamW epsilon
+  max_grad_norm: 1.0  # Max gradient norm for clipping
+
+  # EMA
+  ema_decay: 0.9  # EMA decay rate (0 to disable)
+  ema_update_interval: 4  # EMA update interval (in epochs)
+  ema_device: "cpu"  # Device to store EMA model (options: cpu, cuda)
+
+  # Gradient checkpointing
+  enable_gradient_checkpointing: true  # Enable gradient checkpointing (recommended for Trellis2)
+
+  # Seed
+  seed: 42  # Random seed
+
+# Scheduler Configuration (global defaults, overridden per-stage via model.{stage}_sde)
+scheduler:
+  dynamics_type: "Flow-SDE"  # FlowGRPO SDE for the training stage (shape)
+  noise_level: 1.0  # Noise level for SDE sampling
+  num_sde_steps: 1  # Number of SDE noise steps per rollout (1 of 12 steps is stochastic)
+  sde_steps: [1, 2, 3]  # Eligible timestep indices for SDE noise injection
+  seed: 42  # Scheduler seed (for noise step selection)
+
+# Evaluation settings
+eval:
+  resolution: 1024  # Evaluation resolution
+  per_device_batch_size: 1  # Eval batch size
+  # NOTE: eval.guidance_scale intentionally omitted — see train block above.
+  num_inference_steps: 12  # Number of eval timesteps
+  eval_freq: 20  # Eval frequency in epochs
+  seed: 42  # Eval seed (defaults to training seed)
+
+# Reward Model Configuration
+rewards:
+  - name: "pickscore"
+    reward_model: "PickScore"
+    weight: 1.0
+    batch_size: 8
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: true
+    num_workers: 1
+
+# Optional Evaluation Reward Models
+eval_rewards:
+  name: "pickscore"
+  reward_model: "PickScore"
+  batch_size: 8
+  device: "cuda"
+  dtype: bfloat16
+  async_reward: true
+  num_workers: 1

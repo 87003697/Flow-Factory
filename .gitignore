@@ -101,10 +101,14 @@ latest_checkpointed_iteration.txt
 .claude/CLAUDE.md
 
 # ====================
-# Agent local notes & scratch (personal session logs, not project-level skills)
+# Agent scratch space (temporary analysis, reports, etc.)
+# ====================
+.scratch/
+
+# ====================
+# Agent local notes (personal session logs, not project-level skills)
 # ====================
 .agents/sessions/
-.scratch/
 
 # ====================
 # Local-only artifacts (reference code, third-party checkouts, scratch CSVs)

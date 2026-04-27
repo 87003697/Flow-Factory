@@ -17,16 +17,18 @@ from torch.utils.data import Sampler, Dataset
 from accelerate import Accelerator
 
 from .sampler import (
+    DistributedGroupAlignedSampler,
     DistributedKRepeatSampler,
     GroupContiguousSampler,
-    DistributedGroupAlignedSampler,
+    GroupDistributedSampler,
 )
 from ..hparams import Arguments
 
-_SAMPLER_MAP = {
-    'group_contiguous': GroupContiguousSampler,
-    'distributed_k_repeat': DistributedKRepeatSampler,
-    'distributed_group_aligned': DistributedGroupAlignedSampler,
+SAMPLER_REGISTRY = {
+    "distributed_k_repeat": DistributedKRepeatSampler,
+    "group_contiguous": GroupContiguousSampler,
+    "group_distributed": GroupDistributedSampler,
+    "distributed_group_aligned": DistributedGroupAlignedSampler,
 }
 
 
@@ -40,15 +42,25 @@ def get_data_sampler(
     The sampler strategy is determined by ``config.data_args.sampler_type``,
     which is resolved in ``Arguments._resolve_sampler_type()`` and aligned in
     ``Arguments._align_batch_geometry()`` during ``__post_init__``.
+
+    Returns:
+        - GroupContiguousSampler when resolved type is ``"group_contiguous"``
+          (keeps each group's samples on the same rank)
+        - GroupDistributedSampler when resolved type is ``"group_distributed"``
+          (split each group evenly across ranks; requires ``K % W == 0``)
+        - DistributedGroupAlignedSampler when resolved type is
+          ``"distributed_group_aligned"`` (load-balanced scatter of K
+          copies; requires ``W*B % K == 0`` only)
+        - DistributedKRepeatSampler when resolved type is ``"distributed_k_repeat"``
+          (default behavior)
     """
     training_args = config.training_args
     sampler_type = config.data_args.sampler_type
-    if sampler_type not in _SAMPLER_MAP:
+    sampler_cls = SAMPLER_REGISTRY.get(sampler_type)
+    if sampler_cls is None:
         raise ValueError(
-            f"Unknown sampler_type {sampler_type!r}. "
-            f"Available: {list(_SAMPLER_MAP.keys())}"
+            f"Unknown sampler_type={sampler_type!r}. Expected one of {sorted(SAMPLER_REGISTRY)}."
         )
-    sampler_cls = _SAMPLER_MAP[sampler_type]
     return sampler_cls(
         dataset=dataset,
         batch_size=training_args.per_device_batch_size,
