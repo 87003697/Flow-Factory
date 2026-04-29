@@ -19,7 +19,7 @@ Chunked Forward 核心数据结构。
 """
 import logging
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Callable, Iterator, Tuple
+from typing import Optional, Dict, Iterable, Iterator, List, Callable, Tuple
 import torch
 import torch.nn as nn
 
@@ -279,42 +279,83 @@ class ChunkableSparseTensor:
         if self._chunks is None:
             return self._tensor
         
-        # 合并主 tensor
-        self._tensor = self._merge_tensors(
-            [(c._result, c._meta) for c in self._chunks if c._result is not None]
-        )
+        self._tensor = self._merge_tensors(self._take_chunk_results())
         
-        # 合并附加 SparseTensor
         attached_names = set()
         for chunk in self._chunks:
             attached_names.update(chunk._result_attached.keys())
-        
         for name in attached_names:
-            tensors = [(c._result_attached[name], c._meta) 
-                       for c in self._chunks if name in c._result_attached]
-            self._attached[name] = self._merge_tensors(tensors)
-        
-        for chunk in self._chunks:
-            chunk._result = None
-            chunk._result_attached.clear()
-        
+            self._attached[name] = self._merge_tensors(
+                self._take_attached_results(name)
+            )
+
         return self._tensor
+
+    def _take_chunk_results(self) -> Iterator[Tuple[SparseTensor, ChunkMeta]]:
+        """逐个取出 chunk._result 并解除 chunk 上的外部引用。
+
+        yield 之前就清掉 chunk._result，下游函数中 del tensor 即真正释放。
+        这样后续 torch.cat 申请输出时不会与原 chunk 张量并存（避免 3× 峰值）。
+        """
+        for chunk in self._chunks:
+            tensor = chunk._result
+            if tensor is None:
+                continue
+            chunk._result = None
+            yield tensor, chunk._meta
+
+    def _take_attached_results(
+        self, name: str,
+    ) -> Iterator[Tuple[SparseTensor, ChunkMeta]]:
+        """逐个取出 chunk._result_attached[name] 并解除 chunk 上的外部引用。"""
+        for chunk in self._chunks:
+            tensor = chunk._result_attached.pop(name, None)
+            if tensor is None:
+                continue
+            yield tensor, chunk._meta
     
     def _merge_tensors(
-        self, 
-        tensors: List[Tuple[SparseTensor, ChunkMeta]]
+        self,
+        source: Iterable[Tuple[SparseTensor, ChunkMeta]],
     ) -> SparseTensor:
         """
-        合并多个 chunk 结果，丢弃 halo 区域，按坐标规范排序。
+        合并多个 chunk 结果，丢弃 halo 区域，按坐标规范排序（仅在 grad 开启时）。
         
         ★ 类型契约：始终返回有效的 SparseTensor（可能是 0 点的空张量），
           不返回 None。退化 latent 时返回 0 点 SparseTensor，
           由上层 ``h.feats.shape[0] == 0`` 自然触发 StageSkipError。
+
+        所有权约定：``source`` 在 yield ``(tensor, meta)`` 之前必须解除外部
+        对该 tensor 的引用（参见 ``_take_chunk_results``）。这样函数内
+        ``del tensor`` 就是真正释放——torch.cat 申请输出时无需与原 chunk
+        张量并存（避免 chunk + 切片 + cat 输出的 3× 显存峰值）。
         """
-        # ────────────────────────────────────────────────────
-        # 退化保护：无 chunk 结果（输入即为空、或所有 chunk 被跳过）
-        # ────────────────────────────────────────────────────
-        if not tensors:
+        torch.cuda.empty_cache()  # 回收碎片显存，为 merge + sort 的临时张量留空间
+        
+        all_coords, all_feats = [], []
+        merged_scale = None
+        n_chunks_seen = 0
+        
+        for tensor, meta in source:
+            n_chunks_seen += 1
+            if merged_scale is None:
+                merged_scale = tensor._scale
+            
+            local_start = meta.actual_halo * self._coord_scale
+            local_end = (meta.actual_halo + meta.end - meta.start) * self._coord_scale
+            
+            valid = (tensor.coords[:, self._axis] >= local_start) & \
+                    (tensor.coords[:, self._axis] < local_end)  # (N_chunk,)
+            
+            valid_coords = tensor.coords[valid].clone()  # (N_valid, 4)
+            valid_coords[:, self._axis] = \
+                valid_coords[:, self._axis] - local_start + meta.start * self._coord_scale  # (N_valid, 4)
+            
+            all_coords.append(valid_coords)
+            all_feats.append(tensor.feats[valid])  # (N_valid, C)
+            del tensor, valid
+        
+        if not all_feats:
             logging.warning(
                 "_merge_tensors: no chunk results (degenerate latent) "
                 "→ returning 0-point SparseTensor"
@@ -327,45 +368,13 @@ class ChunkableSparseTensor:
                 torch.zeros(0, 4, dtype=torch.int32, device=device),        # (0, 4)
                 scale=self._tensor._scale,
             )
-        
-        # ────────────────────────────────────────────────────
-        # 主逻辑：halo 过滤 + 全局坐标恢复 + 规范排序
-        # ────────────────────────────────────────────────────
-        torch.cuda.empty_cache()  # 回收碎片显存，为 merge + sort 的临时张量留空间
-        
-        all_coords, all_feats = [], []
-        merged_scale = None
-        
-        for i in range(len(tensors)):
-            tensor, meta = tensors[i]
-            tensors[i] = None  # 释放列表对 chunk tensor 的引用
-            
-            if merged_scale is None:
-                merged_scale = tensor._scale
-            
-            # 计算有效区域边界
-            local_start = meta.actual_halo * self._coord_scale
-            local_end = (meta.actual_halo + meta.end - meta.start) * self._coord_scale
-            
-            valid = (tensor.coords[:, self._axis] >= local_start) & \
-                    (tensor.coords[:, self._axis] < local_end)  # (N_chunk,)
-            
-            # 恢复全局坐标
-            valid_coords = tensor.coords[valid].clone()  # (N_valid, 4)
-            valid_coords[:, self._axis] = \
-                valid_coords[:, self._axis] - local_start + meta.start * self._coord_scale  # (N_valid, 4)
-            
-            all_coords.append(valid_coords)
-            all_feats.append(tensor.feats[valid])  # (N_valid, C)
-            del tensor, valid
-        
+
+        torch.cuda.empty_cache()  # 让上面 del 的 chunk 张量回到 allocator pool，给 cat 让出空间
+
         merged_coords = torch.cat(all_coords)  # (N, 4)
         merged_feats = torch.cat(all_feats)    # (N, C)
         del all_coords, all_feats              # 释放列表引用，让 chunk 碎片可回收
         
-        # ────────────────────────────────────────────────────
-        # 退化保护：halo 过滤后无有效点
-        # ────────────────────────────────────────────────────
         if merged_coords.shape[0] == 0:
             logging.warning(
                 "_merge_tensors: all chunks empty after halo filtering "

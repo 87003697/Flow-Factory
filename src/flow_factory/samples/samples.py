@@ -260,6 +260,7 @@ class BaseSample:
         elif self.prompt_ids is not None:
             hasher.update(self.prompt_ids.cpu().numpy().tobytes())
 
+        # Hash negative prompt
         if self.negative_prompt is not None:
             hasher.update(self.negative_prompt.encode('utf-8'))
         elif self.negative_prompt_ids is not None:

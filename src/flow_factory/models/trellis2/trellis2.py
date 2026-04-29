@@ -87,6 +87,7 @@ from trellis2.utils import render_utils
 from o_voxel.convert import flexible_dual_grid_to_mesh
 
 from .chunked_mixin import ChunkedDecoderMixin
+from .pbr_mesh_renderer_chunked import render_frames_chunked
 
 
 def _composite_rgba_pil(
@@ -2196,7 +2197,7 @@ class Trellis2Adapter(BaseAdapter):
             feats=features.to(device=device, dtype=torch.float32),
             coords=coords.to(device),
         )
-        
+
         with torch.autocast('cuda', enabled=False):
             tex_voxels = decoder.forward_chunked(slat, guide_subs=subs) * 0.5 + 0.5
         
@@ -2257,7 +2258,6 @@ class Trellis2Adapter(BaseAdapter):
             voxel_shape=torch.Size([*tex_voxels.shape, *tex_voxels.spatial_shape]),
             layout=self.pipeline.pbr_attr_layout if hasattr(self.pipeline, 'pbr_attr_layout') else None,
         )
-        
         return textured_mesh
 
     def _build_envmap(self, envmap_path: Optional[str] = None) -> Any:
@@ -2320,7 +2320,6 @@ class Trellis2Adapter(BaseAdapter):
             return sample
 
         torch.cuda.empty_cache()
-        mesh.simplify(16777216)
 
         if envmap is None:
             envmap = self._build_envmap(envmap_path)
@@ -2337,18 +2336,22 @@ class Trellis2Adapter(BaseAdapter):
         extrinsics, intrinsics = render_utils.yaw_pitch_r_fov_to_extrinsics_intrinsics(
             yaws_rad, pitchs_rad, r, _FOV_DEG,
         )
-        ret = render_utils.render_frames(
+        # nvdiffrast 在 faces > ~16M (2^24) 时会触发 subtriangle count overflow，
+        # 改用 chunked 渲染器按 4M faces 分块跑 + 跨 chunk 深度合成（无上限），
+        # 不再依赖 mesh.simplify 做面数限流。
+        ret = render_frames_chunked(
             mesh, extrinsics, intrinsics,
-            {'resolution': resolution, 'bg_color': bg_color},
+            {'resolution': resolution},
             envmap=envmap,
             verbose=render_kwargs.pop('verbose', False),
             **render_kwargs,
         )
-        shaded = np.stack(ret['shaded']).astype(np.float32) / 255.0  # (T, H, W, 3)
-        alpha = np.stack(ret['alpha'])[..., :1].astype(np.float32) / 255.0  # (T, H, W, 1)
-        bg = np.float32(bg_color).reshape(1, 1, 1, 3)            # (1, 1, 1, 3)
-        frames = np.clip(shaded + bg * (1 - alpha), 0, 1)        # (T, H, W, 3)
-        frames = torch.from_numpy(frames).permute(0, 3, 1, 2)    # (T, C, H, W) float32
+        shaded = ret['shaded']                                       # (T, 3, H, W) cuda float [0, 1]
+        alpha = ret['alpha']                                         # (T, 1, H, W) cuda float [0, 1]
+        bg = torch.tensor(
+            bg_color, dtype=shaded.dtype, device=shaded.device,
+        ).reshape(1, 3, 1, 1)                                        # (1, 3, 1, 1)
+        frames = (shaded + bg * (1 - alpha)).clamp(0, 1).cpu()       # (T, 3, H, W) float32
 
         sample.video = frames
         return sample
