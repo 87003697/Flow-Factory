@@ -1,0 +1,61 @@
+# scripts/data/score_ltx_syn_data.yaml
+# Configuration for scoring cached LTX2 synthesised samples.
+# Used together with `scripts/data/score_ltx_syn_data.py` (torchrun multi-GPU).
+#
+# Pre-flight:
+#   1. Free GPUs 0..N-1 (kill any stale training).
+#   2. (Optional) Start UnifiedReward vLLM server on a separate GPU:
+#        bash scripts/data/start_unified_reward_server.sh
+#      and verify `curl http://localhost:8080/v1/models` lists `UnifiedReward`.
+#   3. Activate env:
+#        source ~/anaconda3/etc/profile.d/conda.sh && conda activate flow-factory
+
+data:
+  dataset_root: data/ltx_syn_data/ltx_qa_subset_200    # Contains dataset.json + latents/* + audio_latents/*.
+  out_dir: data/ltx_syn_data/ltx_qa_subset_200/scoring_run_v1  # decoded/ + scores_rank*.jsonl + scores.jsonl + summary.json
+  prompt_field: generation_prompt                       # Field used as the text prompt for all rewards.
+
+model:
+  ltx2_repo: Lightricks/LTX-2                           # LTX2 pipeline weights (vae + audio_vae + vocoder used).
+  vae_dtype: bfloat16                                   # Options: bfloat16, float16, float32. Switch if colour artefacts.
+  decode:                                               # Mirrors official decode-time injection knobs.
+    decode_timestep: 0.0
+    decode_noise_scale: null
+
+# All rewards are pointwise. RewardProcessor is intentionally bypassed (we
+# call models directly per-sample) so each rank stays local + we keep
+# RewardModelOutput.extra_info (for UnifiedReward axis sub-scores).
+rewards:
+  - name: imagebind
+    reward_model: imagebind
+    weight: 1.0
+    batch_size: 1
+    device: cuda                                         # Replaced by cuda:{LOCAL_RANK} per rank.
+    dtype: bfloat16
+    mode: all                                            # weighted: 0.5*audio_video + 0.25*text_audio + 0.25*text_video.
+
+  - name: clap
+    reward_model: clap
+    weight: 1.0
+    batch_size: 4
+    device: cpu                                          # CLAP per-rank instance kept on CPU to spare VRAM.
+    dtype: float32
+    model_name_or_path: laion/larger_clap_general
+
+  - name: unified_reward_video_aps
+    reward_model: unified_reward_video_aps
+    weight: 1.0
+    batch_size: 1                                        # We call per-sample; vLLM still parallelises internally.
+    device: cpu                                          # API-only model; device unused.
+    dtype: float32
+    api_base_url: http://localhost:8080/v1
+    api_key: EMPTY
+    vlm_model: UnifiedReward
+    max_concurrent: 8                                    # Conservative -- multiple ranks share the same server.
+    max_retries: 5
+    timeout: 120
+    max_tokens: 1024
+    max_frames: 16                                       # Frames sampled uniformly from the decoded clip.
+    alignment_weight: 1.0
+    physics_weight: 1.0
+    style_weight: 1.0
