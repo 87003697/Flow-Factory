@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Union, List, Dict, Any, Optional, Tuple, ClassVar
+from typing import Union, List, Dict, Any, Optional, Tuple, ClassVar, Literal
 from dataclasses import dataclass, field
 from collections import defaultdict
 from contextlib import contextmanager
@@ -2293,6 +2293,7 @@ class Trellis2Adapter(BaseAdapter):
         bg_color: Tuple[float, float, float] = (0, 0, 0),
         envmap: Optional[Any] = None,
         envmap_path: Optional[str] = None,
+        render_mode: Literal['shaded', 'clay', 'normal'] = 'shaded',
         **render_kwargs,
     ) -> Trellis2Sample:
         """Decode latents to mesh and render deterministic multiview frames.
@@ -2309,6 +2310,18 @@ class Trellis2Adapter(BaseAdapter):
                 when called in a loop).
             envmap_path: Path to ``.exr`` HDR file; used only when *envmap*
                 is ``None``.
+            render_mode: Foreground source for ``sample.video``.
+
+                - ``'shaded'`` (default): full PBR-shaded RGB. Reward sees
+                  geometry **and** texture/material — current behaviour.
+                - ``'clay'``: SSAO occlusion broadcast to RGB. Geometry-only,
+                  zero dependency on tex-stage outputs (base_color / metallic
+                  / roughness). Useful for isolating shape attribution.
+                - ``'normal'``: view-space surface normals as RGB. Renderer
+                  already maps normals into ``[0, 1]`` and fills the background
+                  with white. Same geometry-only property as ``'clay'``;
+                  richer detail on smooth / convex shapes where SSAO is too
+                  flat.
             **render_kwargs: Forwarded to ``render_frames``.
 
         Returns:
@@ -2346,12 +2359,28 @@ class Trellis2Adapter(BaseAdapter):
             verbose=render_kwargs.pop('verbose', False),
             **render_kwargs,
         )
-        shaded = ret['shaded']                                       # (T, 3, H, W) cuda float [0, 1]
         alpha = ret['alpha']                                         # (T, 1, H, W) cuda float [0, 1]
+
+        if render_mode == 'shaded':
+            fg = ret['shaded']                                       # (T, 3, H, W) cuda float [0, 1]
+        elif render_mode == 'clay':
+            clay = ret['clay']                                       # (T, 1, H, W) cuda float [0, 1] SSAO occlusion
+            fg = clay.expand(-1, 3, -1, -1).contiguous()             # (T, 3, H, W) cuda float [0, 1] gray
+        elif render_mode == 'normal':
+            # renderer already maps view-space normals into [0, 1] RGB and
+            # fills background with 1.0 (see pbr_mesh_renderer_chunked.py
+            # `out_normal = -gb_cam_normal * 0.5 + 0.5`). No extra rescaling.
+            fg = ret['normal'].clamp(0, 1)                           # (T, 3, H, W) cuda float [0, 1] RGB
+        else:
+            raise ValueError(
+                f"render_latents: unsupported render_mode={render_mode!r}; "
+                "expected one of {'shaded', 'clay', 'normal'}"
+            )
+
         bg = torch.tensor(
-            bg_color, dtype=shaded.dtype, device=shaded.device,
+            bg_color, dtype=fg.dtype, device=fg.device,
         ).reshape(1, 3, 1, 1)                                        # (1, 3, 1, 1)
-        frames = (shaded + bg * (1 - alpha)).clamp(0, 1).cpu()       # (T, 3, H, W) float32
+        frames = (fg + bg * (1 - alpha)).clamp(0, 1).cpu()           # (T, 3, H, W) float32
 
         sample.video = frames
         return sample

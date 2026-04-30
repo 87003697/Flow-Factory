@@ -151,6 +151,44 @@ class RewardProcessor:
         return result
     
     # ============================ Single-batch / Single-group Helpers ============================
+    def _store_reward_extra_info(
+        self,
+        name: str,
+        samples: List[BaseSample],
+        extra_info: Optional[Dict[str, Any]],
+    ) -> None:
+        """Persist per-sample extra outputs from a reward model into samples.
+
+        Currently only handles the ``"reasons"`` field used by
+        ``QwenVLSideBySideReward``: a list of strings aligned with
+        ``samples`` that ends up in ``sample.extra_kwargs["reward_reason"]``
+        for the log formatter to render in wandb captions.
+
+        ``extra_info=None`` and the empty dict short-circuit so rewards
+        without per-sample extras leave ``sample.extra_kwargs`` untouched
+        (preserves the pre-thinking behaviour bit-for-bit).
+        """
+        if extra_info is None:
+            return
+        if not isinstance(extra_info, dict):
+            raise TypeError(
+                f"reward '{name}' extra_info must be a dict or None, "
+                f"got {type(extra_info).__name__}"
+            )
+        if "reasons" not in extra_info:
+            return
+
+        reasons = extra_info["reasons"]
+        if not isinstance(reasons, list) or len(reasons) != len(samples):
+            raise ValueError(
+                f"reward '{name}' extra_info['reasons'] must be a list with "
+                f"length {len(samples)}, got "
+                f"{type(reasons).__name__} of length "
+                f"{len(reasons) if isinstance(reasons, list) else 'N/A'}"
+            )
+        for sample, reason in zip(samples, reasons):
+            sample.extra_kwargs["reward_reason"] = reason
+
     def _compute_pointwise_batch(
         self, name: str, model: PointwiseRewardModel, batch_samples: List[BaseSample]
     ) -> torch.Tensor:
@@ -167,6 +205,9 @@ class RewardProcessor:
         # via the offload pipeline). Sample objects are not mutated.
         batch_input = move_tensors_to_device(batch_input, model.device)
         output = model(**batch_input)
+        self._store_reward_extra_info(
+            name, batch_samples, getattr(output, "extra_info", None)
+        )
         return torch.as_tensor(
             output.rewards if hasattr(output, 'rewards') else output,
             device='cpu', dtype=torch.float32,
@@ -185,6 +226,9 @@ class RewardProcessor:
         group_input = self._convert_media_format(group_input, model)
         group_input = move_tensors_to_device(group_input, model.device)
         output = model(**group_input)
+        self._store_reward_extra_info(
+            name, group_samples, getattr(output, "extra_info", None)
+        )
         return torch.as_tensor(
             output.rewards if hasattr(output, 'rewards') else output,
             device='cpu', dtype=torch.float32,

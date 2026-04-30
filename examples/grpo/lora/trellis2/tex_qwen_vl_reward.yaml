@@ -1,0 +1,225 @@
+# ============================================================
+# Trellis2 Tex GRPO LoRA + Qwen-VL Side-by-Side Reward
+# ============================================================
+# This example uses a Qwen native VLM (e.g. Qwen3.5-9B, an
+# omni-modal text+image+video model) as the reward model for
+# 3D texture generation via vLLM's
+# OpenAI-compatible HTTP API.  Each rendered video frame is
+# paired with the input condition image as a side-by-side tile
+# (LEFT = condition, RIGHT = render) and scored via Yes/No first-token
+# logprobs (P(Yes)/(P(Yes)+P(No))).  Training-stage / batch / sampler config is
+# inherited verbatim from `tex_unified_reward.yaml`; only the
+# reward block has been swapped.
+#
+# Prerequisites:
+#   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
+#          CUDA_VISIBLE_DEVICES=7 vllm serve Qwen/Qwen3.5-9B \
+#              --served-model-name Qwen/Qwen3.5-9B --host 0.0.0.0 --port 8000 \
+#              --trust-remote-code --gpu-memory-utilization 0.9 \
+#              --enable-prefix-caching \
+#              --reasoning-parser qwen3 \
+#              --limit-mm-per-prompt '{"image": 32}' \
+#              --max-num-seqs 512 --max-model-len 16384
+#      `--reasoning-parser qwen3` is REQUIRED when `enable_reason: true`
+#      so the <think>...</think> block is split into the structured
+#      reasoning field instead of being inlined into `content` (otherwise
+#      the wandb caption picks up the raw <think> tags and the
+#      reason-conditioned yes/no is fed garbage). Use `qwen3` for the
+#      whole Qwen3 / Qwen3.5 / Qwen3-VL family (vLLM >= 0.9). On older
+#      vLLM (<= 0.8) without a `qwen3` parser, fall back to
+#      `--reasoning-parser deepseek_r1` — both populate the same field.
+#      Note: vLLM >= 0.17 emits the parsed text under `message.reasoning`
+#      (RFC vllm-project/vllm#27755) instead of the older
+#      `message.reasoning_content`; the reward code reads both fields
+#      transparently.
+#      `--enable-prefix-caching` is also mandatory: each sample sends
+#      the SAME image stack twice (reason + yes/no), and prefix caching
+#      is what keeps the visual prefill cost from doubling.
+#   2. Use the remaining GPUs for training (e.g., GPU 0-6):
+#          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/trellis2/qwen_vl_reward.yaml
+#
+# Concurrency budget (must size --max-num-seqs accordingly):
+#   peak_concurrent_requests = world_size * num_workers * max_concurrent
+#   default here = 7 * 4 * 16 = 448  -> --max-num-seqs >= 512 recommended.
+#   Reason and yes/no share the SAME `max_concurrent` semaphore per
+#   process, so peak in-flight requests do not double; throughput per
+#   epoch roughly halves instead. If the server backs up, lower
+#   `num_workers` / `max_concurrent` first before raising `--max-num-seqs`.
+#
+# Tuning notes:
+#   - tile_resolution * 2 is the long edge sent to the VLM; raise
+#     it for finer details, lower it to fit token budgets.
+#   - max_frames must satisfy --limit-mm-per-prompt.image >= max_frames.
+#   - enable_reason: true makes scoring thinking-conditioned. Each sample
+#     issues TWO requests: (1) a visible reason via enable_thinking=True,
+#     (2) a 1-token Yes/No conditioned on that same reason. The reason is
+#     also surfaced in wandb captions via RewardProcessor.extra_info.
+#     If the reason call fails / returns blank, the reward substitutes
+#     the sentinel string "[reason failed]" as the assistant turn and
+#     STILL runs the reason-conditioned yes/no — the batch never mixes
+#     two reward semantics, no NaN/mean fill is needed, and the sentinel
+#     surfaces directly in the wandb caption for diagnosis.
+#   - reason_max_tokens caps the reason decode budget per sample. Qwen3.5
+#     thinking is VERY verbose (it routinely spends 800+ tokens enumerating
+#     "1. Analyze the request, 2. Identify the numbers, ..." before reaching
+#     a conclusion). Set this >= 1024 so the </think> token actually appears
+#     and the reason captures real visual judgement instead of being
+#     truncated mid-decomposition. If the chosen value is too small, the
+#     `reason` ends mid-sentence and the second-pass yes/no sees a
+#     dangling assistant turn — measurable as low
+#     `reward_*_group_std_mean`.
+# ============================================================
+
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: null  # Path to distributed config file (optional)
+num_processes: 7  # Number of processes to launch (overrides config file)
+main_process_port: 29500
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/trellis2"  # Path to dataset folder (RGBA images + prompts)
+  preprocessing_batch_size: 4  # Batch size for preprocessing
+  dataloader_num_workers: 8  # Number of workers for DataLoader
+  force_reprocess: false  # Force reprocessing of the dataset
+  cache_dir: "/data/zhiyuan_ma/.cache/flow_factory/datasets"  # Cache on /data (2.8T free)
+  max_dataset_size: null  # No limit for production training
+  dataset_type: "image_3d"  # Use Image3DDataset to load RGBA images (alpha = foreground mask)
+  sampler_type: "distributed_group_aligned"  # Scatter K copies of each prompt across ranks within one global iteration (load-balanced); enables Trellis2 cross-GPU upstream stage sharing without requiring K % W == 0
+
+# Model Configuration
+model:
+  finetune_type: 'lora'  # Options: full, lora
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"  # Options: all, default, or list of module names
+  model_name_or_path: "pretrained_weights/TRELLIS.2-4B"  # Local path to TRELLIS.2 4B model
+  model_type: "trellis2"
+  resume_path: null  # Path to load previous checkpoint/lora adapter
+  resume_type: null  # Options: lora, full, state. Null to auto-detect based on `finetune_type`
+  # Trellis2-specific
+  target_flow_model: "tex_slat_1024"  # Options: dense, shape_slat_1024, shape_slat_512, tex_slat_1024, tex_slat_512
+  decode_output: true  # Decode latents to mesh and render multiview frames for reward
+  render_num_frames: 16  # Number of views to render per sample
+  render_resolution: 512  # Render resolution in pixels
+  render_bg_color: [1, 1, 1]  # Render background color (RGB, 0-1 float)
+  envmap_path: null  # Path to .exr HDR envmap file (null for default)
+  # Per-stage SDE overrides (consumed by Trellis2Adapter._stage_sde_kwargs)
+  # Tex stage inherits global Flow-SDE defaults — no override needed.
+  dense_sde:
+    dynamics_type: "ODE"  # Dense stage uses deterministic ODE (not trained)
+  shape_sde:
+    dynamics_type: "ODE"  # Shape stage uses deterministic ODE (upstream, not trained)
+
+log:
+  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  project: "Flow-Factory"  # Project name for logging
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
+  save_freq: 20  # Save frequency in epochs (0 to disable)
+  save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
+
+# Training Configuration
+train:
+  # Trainer settings
+  trainer_type: 'trellis2_grpo'  # Trellis2 GRPO with upstream stage sharing
+  advantage_aggregation: 'gdpo'  # Options: 'sum', 'gdpo'
+  # Clipping
+  clip_range: 1.0e-4  # PPO/GRPO clipping range
+  adv_clip_range: 5.0  # Advantage clipping range
+  # KL div
+  kl_type: 'v-based'  # Options: 'x-based', 'v-based'
+  kl_beta: 0  # KL divergence coefficient. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
+  ref_param_device: 'cuda'  # Options: cpu, cuda
+
+  # Sampling settings
+  resolution: 1024  # Trellis2 shape/tex conditioning resolution
+  num_inference_steps: 12  # Number of timesteps (Trellis2 typically uses 12)
+  # NOTE: Trellis2 reads CFG (guidance_strength / interval / rescale) from
+  # pretrained_weights/TRELLIS.2-4B/pipeline.json's *_slat_sampler.params,
+  # so train.guidance_scale is intentionally omitted here.
+
+  # Batch and sampling
+  per_device_batch_size: 2  # Batch size per device (must divide group_size)
+  group_size: 14  # K=14: W*B=14 copies per prompt across 7 GPUs
+  global_std: false  # Use global std for advantage normalization
+  max_epochs: 2000  # Total training epochs
+  unique_sample_num_per_epoch: 4  # 4 unique prompts × K=14 = 56 samples/epoch
+  gradient_step_per_epoch: 4  # Gradient steps per epoch
+  gradient_accumulation_steps: 1  # M=4 batches / 4 gradient_steps = 1
+
+  # Optimizer
+  learning_rate: 1.0e-4  # Initial learning rate
+  adam_weight_decay: 1.0e-4  # AdamW weight decay
+  adam_betas: [0.9, 0.999]  # AdamW betas
+  adam_epsilon: 1.0e-8  # AdamW epsilon
+  max_grad_norm: 1.0  # Max gradient norm for clipping
+
+  # EMA
+  ema_decay: 0.9  # EMA decay rate (0 to disable)
+  ema_update_interval: 4  # EMA update interval (in epochs)
+  ema_device: "cpu"  # Device to store EMA model (options: cpu, cuda)
+
+  # Gradient checkpointing
+  enable_gradient_checkpointing: true  # Enable gradient checkpointing (recommended for Trellis2)
+
+  # Seed
+  seed: 42  # Random seed
+
+# Scheduler Configuration (global defaults, overridden per-stage via model.{stage}_sde)
+scheduler:
+  dynamics_type: "Flow-SDE"  # FlowGRPO SDE for the training stage (tex)
+  noise_level: 1.0  # Noise level for SDE sampling
+  num_sde_steps: 1  # Number of SDE noise steps per rollout
+  sde_steps: [1, 2, 3]  # Eligible timestep indices for SDE noise injection
+  seed: 42  # Scheduler seed (for noise step selection)
+
+# Evaluation settings
+eval:
+  resolution: 1024  # Evaluation resolution
+  per_device_batch_size: 1  # Eval batch size
+  # NOTE: eval.guidance_scale intentionally omitted — see train block above.
+  num_inference_steps: 12  # Number of eval timesteps
+  eval_freq: 20  # Eval frequency in epochs
+  seed: 42  # Eval seed (defaults to training seed)
+
+# Reward Model Configuration
+rewards:
+  - name: "qwen_vl_side_by_side"
+    reward_model: "qwen_vl_side_by_side"
+    batch_size: 4
+    async_reward: true
+    num_workers: 4
+    api_base_url: "http://localhost:8000/v1"
+    api_key: "EMPTY"
+    vlm_model: "Qwen/Qwen3.5-9B"
+    max_concurrent: 16
+    max_retries: 10
+    timeout: 120
+    max_frames: 16
+    tile_resolution: 512
+    top_logprobs: 20
+    canonicalize: false
+    enable_reason: true
+    reason_max_tokens: 1024
+
+# Optional Evaluation Reward Models
+eval_rewards:
+  name: "qwen_vl_side_by_side"
+  reward_model: "qwen_vl_side_by_side"
+  batch_size: 4
+  async_reward: true
+  num_workers: 4
+  api_base_url: "http://localhost:8000/v1"
+  api_key: "EMPTY"
+  vlm_model: "Qwen/Qwen3.5-9B"
+  max_concurrent: 16
+  max_retries: 10
+  timeout: 120
+  max_frames: 16
+  tile_resolution: 512
+  top_logprobs: 20
+  canonicalize: false
+  enable_reason: true
+  reason_max_tokens: 1024

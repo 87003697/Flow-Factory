@@ -189,8 +189,25 @@ def _to_video_list(
     return []
 
 
+def _format_reward_reason_caption(
+    sample: BaseSample, max_reason_length: int = 120
+) -> str:
+    """Return the optional reward reason stored for this sample."""
+    if "reward_reason" not in sample.extra_kwargs:
+        return ""
+
+    reason = sample.extra_kwargs["reward_reason"]
+    if not isinstance(reason, str) or not reason.strip():
+        return ""
+
+    snippet = reason.strip().replace("\n", " ")
+    if len(snippet) > max_reason_length:
+        snippet = snippet[:max_reason_length] + "..."
+    return snippet
+
+
 def _build_sample_caption(sample: BaseSample, max_length: Optional[int] = None) -> str:
-    """Build caption from reward and prompt."""
+    """Build caption ``reward | reason | prompt`` from the sample's extras."""
     parts = []
     if "rewards" in sample.extra_kwargs:
         rewards = sample.extra_kwargs["rewards"]
@@ -206,6 +223,11 @@ def _build_sample_caption(sample: BaseSample, max_length: Optional[int] = None) 
                 parts.append(f"{next(iter(rewards.values())):.2f}")
             else:
                 parts.append(", ".join(f"{k}: {v:.2f}" for k, v in rewards.items()))
+
+    reason_caption = _format_reward_reason_caption(sample)
+    if reason_caption:
+        parts.append(reason_caption)
+
     if sample.prompt:
         parts.append(
             sample.prompt[:max_length] + "..."
