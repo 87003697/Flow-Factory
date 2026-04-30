@@ -65,7 +65,9 @@ _TEX_EVALUATION_FRAMEWORK = (
     "You are evaluating a 3D generation result. Each attached image is one "
     "frame shown side-by-side: the LEFT half is the input condition image; "
     "the RIGHT half is one rendered view of the generated 3D asset (split "
-    "at the vertical center; width:height is 2:1).\n\n"
+    "at the vertical center; width:height is 2:1). Use the caption as a "
+    "semantic description of the intended object/subject, while basing the "
+    "judgment on the visual match between the condition image and the render.\n\n"
     "Consider ALL of the following across the frames:\n"
     "1. Identity: same object/subject as the condition.\n"
     "2. Geometry: shape, proportions, structural fidelity.\n"
@@ -76,18 +78,20 @@ _TEX_EVALUATION_FRAMEWORK = (
 )
 
 _TEX_YES_NO_DECISION = (
-    "Considering every frame holistically, does the rendered 3D asset "
-    "match the condition well enough to count as a successful generation? "
-    "Answer Yes or No."
+    "Considering every frame holistically, is the rendered 3D asset a "
+    "reasonable visual match to the condition image, taking into account "
+    "identity, geometry, texture/color, multi-view consistency, and "
+    "artifacts? Answer Yes or No."
 )
 
 _TEX_REASON_BODY = (
-    "Briefly analyze the frames in 1-3 sentences, citing concrete visual "
-    "evidence for each of the five aspects above (identity, geometry, "
-    "texture & color, multi-view consistency, artifacts). Focus on details "
-    "that distinguish this specific render from other plausible ones (e.g. "
-    "geometry errors, texture misalignment, color mismatch, holes, blank "
-    "faces, view inconsistency). Do not output a score."
+    "Describe the most relevant visual observations in 2-4 concise "
+    "sentences. Use the same evaluation perspective across samples: "
+    "identity match, geometry and proportions, texture/color alignment, "
+    "multi-view consistency, and visible artifacts. Mention both supporting "
+    "evidence and limiting issues when present. Keep the analysis "
+    "evidence-focused rather than concluding whether the render passes or "
+    "fails. Do not output a score."
 )
 
 _SHAPE_EVALUATION_FRAMEWORK = (
@@ -97,7 +101,10 @@ _SHAPE_EVALUATION_FRAMEWORK = (
     "generated 3D mesh, shown as matte gray clay (no texture, no color). "
     "This color/texture difference is EXPECTED — only geometry is being "
     "optimized in this stage. Judge geometry only; do NOT penalize for "
-    "missing color, missing texture, or material mismatch.\n\n"
+    "missing color, missing texture, or material mismatch. Use the caption "
+    "as a semantic description of the intended object/subject, while basing "
+    "the judgment on the visual geometry match between the condition image "
+    "and the render.\n\n"
     "Consider ALL of the following across the frames:\n"
     "1. Identity: the rendered shape depicts the same object/subject as the "
     "condition (recognizable from silhouette and prominent geometric "
@@ -113,15 +120,21 @@ _SHAPE_EVALUATION_FRAMEWORK = (
 )
 
 _SHAPE_YES_NO_DECISION = (
-    "Does the rendered 3D mesh match the condition object's geometry well "
-    "enough to count as a successful shape generation? Answer Yes or No."
+    "Considering every frame holistically, is the rendered 3D mesh a "
+    "reasonable geometry match to the condition object, taking into account "
+    "identity, silhouette, geometry, multi-view consistency, and shape "
+    "artifacts while ignoring color/texture differences? Answer Yes or No."
 )
 
 _SHAPE_REASON_BODY = (
-    "Briefly analyze the frames in 1-3 sentences, citing concrete visual "
-    "evidence for each of the five aspects above (identity, silhouette, "
-    "geometry, multi-view consistency, artifacts). Ignore color/texture "
-    "differences. Do not output a score."
+    "Describe the most relevant visual observations in 2-4 concise "
+    "sentences. Use the same evaluation perspective across samples: "
+    "identity match, silhouette and contour, geometry and proportions, "
+    "multi-view consistency, and visible shape artifacts. Ignore color, "
+    "texture, and material differences because the render is matte gray by "
+    "design. Mention both supporting evidence and limiting issues when "
+    "present. Keep the analysis evidence-focused rather than concluding "
+    "whether the render passes or fails. Do not output a score."
 )
 
 _PROMPT_PRESETS: dict[str, dict[str, str]] = {
@@ -175,9 +188,7 @@ class QwenVLSideBySideReward(UnifiedRewardAPIBase):
         self.reason_thinking_token_budget = int(
             config.extra_kwargs.get("reason_thinking_token_budget", 1024)
         )
-        self.reason_max_tokens = (
-            self.reason_thinking_token_budget + self.REASON_FINAL_TOKEN_MARGIN
-        )
+        self.reason_max_tokens = self.reason_thinking_token_budget + self.REASON_FINAL_TOKEN_MARGIN
 
         self._configure_prompts(config.extra_kwargs.get("prompt_preset", "tex"))
 
@@ -278,8 +289,7 @@ class QwenVLSideBySideReward(UnifiedRewardAPIBase):
                     await asyncio.sleep(sleep_time)
 
         raise RuntimeError(
-            f"QwenVLSideBySideReward API failed after {self.max_retries} retries: "
-            f"{last_error}"
+            f"QwenVLSideBySideReward API failed after {self.max_retries} retries: " f"{last_error}"
         )
 
     REASON_FIELD_PRIORITY: Tuple[str, ...] = (
@@ -353,9 +363,7 @@ class QwenVLSideBySideReward(UnifiedRewardAPIBase):
             )
         reason = content.strip()
         if not reason:
-            raise ValueError(
-                "QwenVLSideBySideReward reason API returned blank reason"
-            )
+            raise ValueError("QwenVLSideBySideReward reason API returned blank reason")
         return reason
 
     # ============================== Frame Preparation ==============================
@@ -411,9 +419,7 @@ class QwenVLSideBySideReward(UnifiedRewardAPIBase):
         caption_block = f"Caption: {prompt.strip()}\n\n" if prompt.strip() else ""
         return caption_block + self.REASON_PROMPT
 
-    def _build_reason_messages(
-        self, prompt: str, sbs_frames: List[Image.Image]
-    ) -> list:
+    def _build_reason_messages(self, prompt: str, sbs_frames: List[Image.Image]) -> list:
         """Build messages for the thinking-reason request.
 
         Same image payload as ``_build_messages`` but the trailing text
@@ -493,9 +499,7 @@ class QwenVLSideBySideReward(UnifiedRewardAPIBase):
                     self.REASON_FAILED_SENTINEL,
                 )
                 reason = self.REASON_FAILED_SENTINEL
-            messages = self._build_reason_conditioned_messages(
-                prompt, sbs_frames, reason
-            )
+            messages = self._build_reason_conditioned_messages(prompt, sbs_frames, reason)
         else:
             messages = self._build_messages(prompt, sbs_frames)
 
