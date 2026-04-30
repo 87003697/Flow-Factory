@@ -32,7 +32,7 @@ downstream logger can display it in wandb captions.
 Recommended YAML extra_kwargs:
     api_base_url, api_key, vlm_model, max_concurrent, max_retries, timeout,
     max_frames, tile_resolution, top_logprobs, canonicalize,
-    enable_reason, reason_max_tokens
+    enable_reason, reason_thinking_token_budget, prompt_preset
 """
 from __future__ import annotations
 
@@ -55,6 +55,89 @@ from .vllm_evaluate import _get_yes_cond_prob
 logger = logging.getLogger(__name__)
 
 
+# Stage-specific rubric presets. The ``tex`` preset assumes the side-by-side
+# RIGHT panel is a fully textured RGB render aligned with the colored condition;
+# the ``shape`` preset assumes the RIGHT panel is a matte gray clay render with
+# texture/color absent BY DESIGN (only geometry is being optimized in that
+# stage). Selected at construction via ``extra_kwargs.prompt_preset``.
+
+_TEX_EVALUATION_FRAMEWORK = (
+    "You are evaluating a 3D generation result. Each attached image is one "
+    "frame shown side-by-side: the LEFT half is the input condition image; "
+    "the RIGHT half is one rendered view of the generated 3D asset (split "
+    "at the vertical center; width:height is 2:1).\n\n"
+    "Consider ALL of the following across the frames:\n"
+    "1. Identity: same object/subject as the condition.\n"
+    "2. Geometry: shape, proportions, structural fidelity.\n"
+    "3. Texture & color: alignment with the condition.\n"
+    "4. Multi-view consistency: the asset stays coherent across frames.\n"
+    "5. Artifacts: absence of broken geometry, holes, color bleeding, or "
+    "solid blank renders.\n\n"
+)
+
+_TEX_YES_NO_DECISION = (
+    "Considering every frame holistically, does the rendered 3D asset "
+    "match the condition well enough to count as a successful generation? "
+    "Answer Yes or No."
+)
+
+_TEX_REASON_BODY = (
+    "Briefly analyze the frames in 1-3 sentences, citing concrete visual "
+    "evidence for each of the five aspects above (identity, geometry, "
+    "texture & color, multi-view consistency, artifacts). Focus on details "
+    "that distinguish this specific render from other plausible ones (e.g. "
+    "geometry errors, texture misalignment, color mismatch, holes, blank "
+    "faces, view inconsistency). Do not output a score."
+)
+
+_SHAPE_EVALUATION_FRAMEWORK = (
+    "You are evaluating a 3D shape generation result. Each attached image "
+    "is one frame shown side-by-side: the LEFT half is the input condition "
+    "image (in full color); the RIGHT half is one rendered view of the "
+    "generated 3D mesh, shown as matte gray clay (no texture, no color). "
+    "This color/texture difference is EXPECTED — only geometry is being "
+    "optimized in this stage. Judge geometry only; do NOT penalize for "
+    "missing color, missing texture, or material mismatch.\n\n"
+    "Consider ALL of the following across the frames:\n"
+    "1. Identity: the rendered shape depicts the same object/subject as the "
+    "condition (recognizable from silhouette and prominent geometric "
+    "features alone).\n"
+    "2. Silhouette & contour: the render's outline matches the condition "
+    "object's shape from this view.\n"
+    "3. Geometry: proportions, structural fidelity, and presence of the key "
+    "parts visible in the condition.\n"
+    "4. Multi-view consistency: the asset stays coherent across frames "
+    "(no shape that flips or morphs between views).\n"
+    "5. Artifacts: absence of holes, floaters, non-manifold spikes, missing "
+    "parts, or solid blank renders.\n\n"
+)
+
+_SHAPE_YES_NO_DECISION = (
+    "Does the rendered 3D mesh match the condition object's geometry well "
+    "enough to count as a successful shape generation? Answer Yes or No."
+)
+
+_SHAPE_REASON_BODY = (
+    "Briefly analyze the frames in 1-3 sentences, citing concrete visual "
+    "evidence for each of the five aspects above (identity, silhouette, "
+    "geometry, multi-view consistency, artifacts). Ignore color/texture "
+    "differences. Do not output a score."
+)
+
+_PROMPT_PRESETS: dict[str, dict[str, str]] = {
+    "tex": {
+        "framework": _TEX_EVALUATION_FRAMEWORK,
+        "yes_no_decision": _TEX_YES_NO_DECISION,
+        "reason_body": _TEX_REASON_BODY,
+    },
+    "shape": {
+        "framework": _SHAPE_EVALUATION_FRAMEWORK,
+        "yes_no_decision": _SHAPE_YES_NO_DECISION,
+        "reason_body": _SHAPE_REASON_BODY,
+    },
+}
+
+
 class QwenVLSideBySideReward(UnifiedRewardAPIBase):
     """Side-by-side frames + Yes/No logprob reward (see ``vllm_evaluate``).
 
@@ -66,45 +149,20 @@ class QwenVLSideBySideReward(UnifiedRewardAPIBase):
         enable_reason (bool): If True, generate a thinking-conditioned reason
             per sample and use it as additional context for the Yes/No
             question. Default False.
-        reason_max_tokens (int): Cap on tokens generated for the reason.
-            Only used when ``enable_reason=True``. Default 384.
+        reason_thinking_token_budget (int): vLLM ``thinking_token_budget`` for
+            the reason request — the only knob controlling Qwen3.5 thinking
+            effort. Defaults to 1024. The OpenAI-side ``max_tokens`` is
+            internally derived as ``thinking_token_budget +
+            REASON_FINAL_TOKEN_MARGIN`` so the model always has room to emit
+            ``</think>`` and final content after the thinking
+            section is forced to close. vLLM must be started with
+            ``--reasoning-parser qwen3 --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'``.
     """
 
     required_fields = ("prompt", "video", "condition_images")
     use_tensor_inputs = False
 
-    YES_NO_PROMPT = (
-        "You are evaluating a 3D generation result. Each attached image is one "
-        "frame shown side-by-side: the LEFT half is the input condition image; "
-        "the RIGHT half is one rendered view of the generated 3D asset (split "
-        "at the vertical center; width:height is 2:1).\n\n"
-        "Consider ALL of the following across the frames:\n"
-        "1. Identity: same object/subject as the condition.\n"
-        "2. Geometry: shape, proportions, structural fidelity.\n"
-        "3. Texture & color: alignment with the condition.\n"
-        "4. Multi-view consistency: the asset stays coherent across frames.\n"
-        "5. Artifacts: absence of broken geometry, holes, color bleeding, or "
-        "solid blank renders.\n\n"
-        "Considering every frame holistically, does the rendered 3D asset "
-        "match the condition well enough to count as a successful generation? "
-        "Answer Yes or No."
-    )
-
-    REASON_PROMPT = (
-        "Analyze the side-by-side frames briefly in 1-3 sentences. "
-        "Mention the main visual evidence about identity, geometry, "
-        "texture/color, multi-view consistency, and artifacts. Focus on "
-        "visual details that distinguish this specific render from other "
-        "plausible renders, such as geometry errors, texture alignment, "
-        "color mismatch, holes, blank faces, or view inconsistency. "
-        "Do not output a score."
-    )
-
-    REASON_CONDITIONED_YES_NO_PROMPT = (
-        "Based on the reasoning above, does the rendered 3D asset match "
-        "the condition well enough to count as a successful generation? "
-        "Answer Yes or No."
-    )
+    REASON_FINAL_TOKEN_MARGIN = 1024
 
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -114,7 +172,14 @@ class QwenVLSideBySideReward(UnifiedRewardAPIBase):
         self.top_logprobs = int(config.extra_kwargs.get("top_logprobs", 20))
         self.canonicalize = bool(config.extra_kwargs.get("canonicalize", False))
         self.enable_reason = bool(config.extra_kwargs.get("enable_reason", False))
-        self.reason_max_tokens = int(config.extra_kwargs.get("reason_max_tokens", 384))
+        self.reason_thinking_token_budget = int(
+            config.extra_kwargs.get("reason_thinking_token_budget", 1024)
+        )
+        self.reason_max_tokens = (
+            self.reason_thinking_token_budget + self.REASON_FINAL_TOKEN_MARGIN
+        )
+
+        self._configure_prompts(config.extra_kwargs.get("prompt_preset", "tex"))
 
         if self.top_logprobs < 1:
             raise ValueError(
@@ -129,11 +194,43 @@ class QwenVLSideBySideReward(UnifiedRewardAPIBase):
                 "QwenVLSideBySideReward: tile_resolution must be positive, "
                 f"got {self.tile_resolution}"
             )
-        if self.reason_max_tokens <= 0:
+        if self.reason_thinking_token_budget <= 0:
             raise ValueError(
-                "QwenVLSideBySideReward: reason_max_tokens must be positive, "
-                f"got {self.reason_max_tokens}"
+                "QwenVLSideBySideReward: reason_thinking_token_budget must be "
+                f"positive, got {self.reason_thinking_token_budget}"
             )
+
+    # ============================== Prompt Configuration ==============================
+
+    def _configure_prompts(self, preset_name: str) -> None:
+        """Validate ``preset_name`` and bind the resolved prompt strings.
+
+        Sets ``self.prompt_preset`` (the preset name) plus five UPPERCASE
+        instance attributes that act as set-once constants for scoring:
+        ``self.EVALUATION_FRAMEWORK``, ``self.YES_NO_DECISION``,
+        ``self.YES_NO_PROMPT``, ``self.REASON_PROMPT``, and
+        ``self.REASON_CONDITIONED_YES_NO_PROMPT``. ``YES_NO_DECISION`` is
+        shared verbatim between direct and reason-conditioned yes/no, so
+        the prompt-only ablation between the two paths differs ONLY by the
+        intermediate assistant reason turn.
+
+        Raises ``ValueError`` if ``preset_name`` is not registered in
+        ``_PROMPT_PRESETS``.
+        """
+        if preset_name not in _PROMPT_PRESETS:
+            raise ValueError(
+                "QwenVLSideBySideReward: prompt_preset must be one of "
+                f"{sorted(_PROMPT_PRESETS)}, got {preset_name!r}"
+            )
+        preset = _PROMPT_PRESETS[preset_name]
+        framework = preset["framework"]
+        decision = preset["yes_no_decision"]
+        self.prompt_preset = preset_name
+        self.EVALUATION_FRAMEWORK = framework
+        self.YES_NO_DECISION = decision
+        self.YES_NO_PROMPT = framework + decision
+        self.REASON_PROMPT = framework + preset["reason_body"]
+        self.REASON_CONDITIONED_YES_NO_PROMPT = decision
 
     # ============================== API Queries ==============================
 
@@ -186,9 +283,9 @@ class QwenVLSideBySideReward(UnifiedRewardAPIBase):
         )
 
     REASON_FIELD_PRIORITY: Tuple[str, ...] = (
+        "content",
         "reasoning",
         "reasoning_content",
-        "content",
     )
 
     async def _query_reason_text(
@@ -203,23 +300,24 @@ class QwenVLSideBySideReward(UnifiedRewardAPIBase):
         Uses the same VLM endpoint as ``_query_yes_no_logprob`` but with
         ``enable_thinking=True`` and a higher ``max_tokens`` budget.
 
-        Reads the reason via an explicit field priority list to stay
+        Reads the final content first via an explicit field priority list to stay
         compatible with vLLM's evolving schema:
 
-        1. ``reasoning`` — current vLLM field (>= 0.17 / Qwen3.5 standard,
+        1. ``content`` — the final answer after the model's thinking block.
+        2. ``reasoning`` — current vLLM field (>= 0.17 / Qwen3.5 standard,
            tracked by RFC vllm-project/vllm#27755).
-        2. ``reasoning_content`` — deprecated but still emitted on
+        3. ``reasoning_content`` — deprecated but still emitted on
            older vLLM (<= 0.16) and by ``deepseek_r1`` parser builds.
-        3. ``content`` — last-resort fallback when the server is started
-           without ``--reasoning-parser``; the raw ``<think>...</think>``
-           tags will appear inline in the reason string.
 
         All three empty raises ``ValueError``. The caller catches this
         and substitutes ``REASON_FAILED_SENTINEL`` so the sample still
         flows through the reason-conditioned yes/no path (uniform batch
         semantics, no retry, sentinel surfaces in the wandb caption).
         """
-        extra_body = {"chat_template_kwargs": {"enable_thinking": True}}
+        extra_body = {
+            "chat_template_kwargs": {"enable_thinking": True},
+            "thinking_token_budget": self.reason_thinking_token_budget,
+        }
         create_kwargs = dict(
             model=self.vlm_model,
             messages=messages,

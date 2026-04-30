@@ -18,12 +18,13 @@
 #              --trust-remote-code --gpu-memory-utilization 0.9 \
 #              --enable-prefix-caching \
 #              --reasoning-parser qwen3 \
+#              --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}' \
 #              --limit-mm-per-prompt '{"image": 32}' \
 #              --max-num-seqs 512 --max-model-len 16384
 #      `--reasoning-parser qwen3` is REQUIRED when `enable_reason: true`
 #      so the <think>...</think> block is split into the structured
-#      reasoning field instead of being inlined into `content` (otherwise
-#      the wandb caption picks up the raw <think> tags and the
+#      `message.reasoning` field instead of being inlined into `content`
+#      (otherwise the wandb caption picks up the raw <think> tags and the
 #      reason-conditioned yes/no is fed garbage). Use `qwen3` for the
 #      whole Qwen3 / Qwen3.5 / Qwen3-VL family (vLLM >= 0.9). On older
 #      vLLM (<= 0.8) without a `qwen3` parser, fall back to
@@ -32,6 +33,10 @@
 #      (RFC vllm-project/vllm#27755) instead of the older
 #      `message.reasoning_content`; the reward code reads both fields
 #      transparently.
+#      `--reasoning-config` is REQUIRED for the `thinking_token_budget`
+#      knob (see `reason_thinking_token_budget` below). vLLM derives the
+#      <think>/</think> token IDs from this config and refuses requests
+#      that set `thinking_token_budget` without it.
 #      `--enable-prefix-caching` is also mandatory: each sample sends
 #      the SAME image stack twice (reason + yes/no), and prefix caching
 #      is what keeps the visual prefill cost from doubling.
@@ -59,15 +64,16 @@
 #     STILL runs the reason-conditioned yes/no — the batch never mixes
 #     two reward semantics, no NaN/mean fill is needed, and the sentinel
 #     surfaces directly in the wandb caption for diagnosis.
-#   - reason_max_tokens caps the reason decode budget per sample. Qwen3.5
-#     thinking is VERY verbose (it routinely spends 800+ tokens enumerating
-#     "1. Analyze the request, 2. Identify the numbers, ..." before reaching
-#     a conclusion). Set this >= 1024 so the </think> token actually appears
-#     and the reason captures real visual judgement instead of being
-#     truncated mid-decomposition. If the chosen value is too small, the
-#     `reason` ends mid-sentence and the second-pass yes/no sees a
-#     dangling assistant turn — measurable as low
-#     `reward_*_group_std_mean`.
+#   - reason_thinking_token_budget is the ONLY knob for Qwen3.5 thinking
+#     effort. vLLM forces </think> once this budget is reached, so the
+#     reason captures real visual judgement instead of running away into
+#     "1. Analyze the request, 2. Identify the numbers, ..." indefinitely.
+#     Defaults to 1024 in code; raise it for harder visual judgement,
+#     lower it (e.g. 512) for cheaper rollouts. The OpenAI-side
+#     ``max_tokens`` is auto-derived as
+#     ``thinking_token_budget + REASON_FINAL_TOKEN_MARGIN`` (256 tokens
+#     reserved for </think> + any short final content) — there is no
+#     separate ``reason_max_tokens`` knob.
 # ============================================================
 
 # Environment Configuration
@@ -185,6 +191,8 @@ eval:
   seed: 42  # Eval seed (defaults to training seed)
 
 # Reward Model Configuration
+# Only meaningful overrides are listed; api_key/max_retries/timeout/max_frames/
+# top_logprobs/canonicalize fall back to QwenVLSideBySideReward defaults.
 rewards:
   - name: "qwen_vl_side_by_side"
     reward_model: "qwen_vl_side_by_side"
@@ -192,17 +200,12 @@ rewards:
     async_reward: true
     num_workers: 4
     api_base_url: "http://localhost:8000/v1"
-    api_key: "EMPTY"
     vlm_model: "Qwen/Qwen3.5-9B"
     max_concurrent: 16
-    max_retries: 10
-    timeout: 120
-    max_frames: 16
     tile_resolution: 512
-    top_logprobs: 20
-    canonicalize: false
     enable_reason: true
-    reason_max_tokens: 1024
+    reason_thinking_token_budget: 2048  # main thinking-effort knob
+    prompt_preset: "tex"  # tex | shape — picks the rubric matching this stage's render
 
 # Optional Evaluation Reward Models
 eval_rewards:
@@ -212,14 +215,9 @@ eval_rewards:
   async_reward: true
   num_workers: 4
   api_base_url: "http://localhost:8000/v1"
-  api_key: "EMPTY"
   vlm_model: "Qwen/Qwen3.5-9B"
   max_concurrent: 16
-  max_retries: 10
-  timeout: 120
-  max_frames: 16
   tile_resolution: 512
-  top_logprobs: 20
-  canonicalize: false
   enable_reason: true
-  reason_max_tokens: 1024
+  reason_thinking_token_budget: 2048  # main thinking-effort knob
+  prompt_preset: "tex"  # tex | shape — picks the rubric matching this stage's render

@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List
 
 from ..hparams import *
-from .formatting import LogFormatter, LogImage, LogVideo, LogTable
+from .formatting import LogFormatter, LogImage, LogTableIncrement, LogVideo, LogTable
 
 
 class Logger(ABC):
@@ -47,6 +47,19 @@ class Logger(ABC):
             valid_keys = keys.split(',')
             formatted_dict = {k: v for k, v in formatted_dict.items() if k in valid_keys}
 
+        # Incremental table IRs need backend state (e.g., wandb.Table append
+        # mode), so they bypass the regular stateless conversion path. We still
+        # merge their platform objects into ``final_dict`` so the whole step
+        # ships in a single platform log call -- repeating ``platform.log(...,
+        # step=step)`` for the same step is order-sensitive on backends like
+        # wandb and silently drops history rows.
+        incremental_table_data = {
+            k: v for k, v in formatted_dict.items() if isinstance(v, LogTableIncrement)
+        }
+        formatted_dict = {
+            k: v for k, v in formatted_dict.items() if not isinstance(v, LogTableIncrement)
+        }
+
         # 3. Convert IR to Platform Objects
         final_dict = {}
         for k, v in formatted_dict.items():
@@ -55,6 +68,12 @@ class Logger(ABC):
                 final_dict.update(converted)
             else:
                 final_dict[k] = converted
+
+        if incremental_table_data:
+            incremental_platform = self._log_table_increments(incremental_table_data, step)
+            for incr_key, incr_obj in incremental_platform.items():
+                if incr_obj is not None:
+                    final_dict[incr_key] = incr_obj
 
         # 4. Actual Logging
         if final_dict:
@@ -85,6 +104,20 @@ class Logger(ABC):
                 for item in value:
                     if isinstance(item, (LogImage, LogVideo, LogTable)):
                         item.cleanup()
+
+    def _log_table_increments(
+        self,
+        incremental: Dict[str, LogTableIncrement],
+        step: int,
+    ) -> Dict[str, Any]:
+        """Translate incremental table IRs to platform objects keyed by log key.
+
+        The returned dict is merged into the main log payload so all keys for
+        a single step ship in one platform log call. Default implementation
+        returns ``{}`` so backends without append-only table support transparently
+        drop these IRs.
+        """
+        return {}
 
     @abstractmethod
     def _convert_to_platform(

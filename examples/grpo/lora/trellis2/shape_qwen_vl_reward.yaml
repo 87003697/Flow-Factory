@@ -1,20 +1,60 @@
 # ============================================================
-# Trellis2 Shape GRPO LoRA + UnifiedReward-2.0 (APS) Reward
+# Trellis2 Shape GRPO LoRA + Qwen-VL Side-by-Side Reward
 # ============================================================
-# This example uses UnifiedReward-2.0-qwen35-9b as the reward
-# model for 3D shape generation via vLLM's OpenAI-compatible
-# API, scoring rendered multi-view frames along three axes:
-# Alignment / Physics / Style (APS).
+# This example uses a Qwen native VLM (e.g. Qwen3.5-9B, an
+# omni-modal text+image+video model) as the reward model for
+# 3D shape generation via vLLM's OpenAI-compatible HTTP API.
+#
+# Key difference vs `tex_qwen_vl_reward.yaml`:
+#   - The trained stage is **shape**, not tex. The render is a
+#     matte gray clay preview of the generated geometry (no
+#     texture, no color); the side-by-side LEFT panel is still
+#     the colored condition image.
+#   - Reward must be told that this color/texture mismatch is
+#     EXPECTED — otherwise Qwen will reflexively dock points on
+#     every sample. This is exactly what `prompt_preset: "shape"`
+#     does: it swaps the rubric to silhouette + geometry +
+#     artifact aspects and explicitly tells the judge to ignore
+#     color/texture differences.
 #
 # Prerequisites:
 #   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
-#          CUDA_VISIBLE_DEVICES=7 vllm serve CodeGoat24/UnifiedReward-2.0-qwen35-9b \
-#              --served-model-name UnifiedReward --host 0.0.0.0 --port 8080 \
+#          CUDA_VISIBLE_DEVICES=7 vllm serve Qwen/Qwen3.5-9B \
+#              --served-model-name Qwen/Qwen3.5-9B --host 0.0.0.0 --port 8000 \
 #              --trust-remote-code --gpu-memory-utilization 0.9 \
 #              --enable-prefix-caching \
-#              --limit-mm-per-prompt '{"image": 32}'
+#              --reasoning-parser qwen3 \
+#              --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}' \
+#              --limit-mm-per-prompt '{"image": 32}' \
+#              --max-num-seqs 512 --max-model-len 16384
+#      `--reasoning-parser qwen3` + `--reasoning-config` are REQUIRED
+#      when `enable_reason: true` so vLLM splits <think>...</think> into
+#      `message.reasoning` AND can enforce `thinking_token_budget`. See
+#      tex_qwen_vl_reward.yaml header for full background on these flags
+#      and on prefix caching.
 #   2. Use the remaining GPUs for training (e.g., GPU 0-6):
-#          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/trellis2/shape_unified_reward.yaml
+#          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/trellis2/shape_qwen_vl_reward.yaml
+#
+# Concurrency budget (must size --max-num-seqs accordingly):
+#   peak_concurrent_requests = world_size * num_workers * max_concurrent
+#   default here = 7 * 4 * 16 = 448  -> --max-num-seqs >= 512 recommended.
+#   Reason and yes/no share the SAME `max_concurrent` semaphore per
+#   process, so peak in-flight requests do not double; throughput per
+#   epoch roughly halves instead. If the server backs up, lower
+#   `num_workers` / `max_concurrent` first before raising `--max-num-seqs`.
+#
+# Tuning notes:
+#   - tile_resolution * 2 is the long edge sent to the VLM.
+#   - render_num_frames=24 but max_frames=16: the reward subsamples
+#     16 evenly-spaced frames via np.linspace; raise max_frames to 24
+#     if you want full coverage (still well within
+#     --limit-mm-per-prompt.image=32).
+#   - prompt_preset MUST stay "shape" here. Mixing presets (e.g.
+#     using "tex" while rendering gray clay) silently degrades reward
+#     because Qwen will then penalize the expected color absence on
+#     every sample, collapsing group_std.
+#   - reason_thinking_token_budget is the ONLY knob for thinking
+#     effort. See `tex_qwen_vl_reward.yaml` header for full notes.
 # ============================================================
 
 # Environment Configuration
@@ -48,9 +88,9 @@ model:
   # Trellis2-specific
   target_flow_model: "shape_slat_1024"  # Options: dense, shape_slat_1024, shape_slat_512, tex_slat_1024, tex_slat_512
   decode_output: true  # Decode latents to mesh and render multiview frames for reward
-  render_num_frames: 16  # Number of views to render per sample
+  render_num_frames: 24  # Number of views to render per sample (reward subsamples to max_frames)
   render_resolution: 512  # Render resolution in pixels
-  render_bg_color: [1, 1, 1]  # Render background color (RGB, 0-1 float)
+  render_bg_color: [1, 1, 1]  # White background — gray clay reads cleanly against white
   envmap_path: null  # Path to .exr HDR envmap file (null for default)
   # Per-stage SDE overrides (consumed by Trellis2Adapter._stage_sde_kwargs)
   # Shape stage inherits global Flow-SDE defaults — no override needed.
@@ -132,35 +172,33 @@ eval:
   seed: 42  # Eval seed (defaults to training seed)
 
 # Reward Model Configuration
+# Only meaningful overrides are listed; api_key/max_retries/timeout/max_frames/
+# top_logprobs/canonicalize fall back to QwenVLSideBySideReward defaults.
 rewards:
-  - name: "unified_reward_video_aps"
-    reward_model: "unified_reward_video_aps"
+  - name: "qwen_vl_side_by_side"
+    reward_model: "qwen_vl_side_by_side"
     batch_size: 4
-    device: "cuda"
-    dtype: bfloat16
     async_reward: true
     num_workers: 4
-    api_base_url: "http://localhost:8080/v1"
-    vlm_model: "UnifiedReward"
+    api_base_url: "http://localhost:8000/v1"
+    vlm_model: "Qwen/Qwen3.5-9B"
     max_concurrent: 16
-    alignment_weight: 1.0
-    physics_weight: 0.5
-    style_weight: 0.5
-    max_frames: 32
+    tile_resolution: 512
+    enable_reason: true
+    reason_thinking_token_budget: 1024  # main thinking-effort knob
+    prompt_preset: "shape"  # tex | shape — gray-clay render needs shape rubric
 
 # Optional Evaluation Reward Models
 eval_rewards:
-  name: "unified_reward_video_aps"
-  reward_model: "unified_reward_video_aps"
+  name: "qwen_vl_side_by_side"
+  reward_model: "qwen_vl_side_by_side"
   batch_size: 4
-  device: "cuda"
-  dtype: bfloat16
   async_reward: true
   num_workers: 4
-  api_base_url: "http://localhost:8080/v1"
-  vlm_model: "UnifiedReward"
+  api_base_url: "http://localhost:8000/v1"
+  vlm_model: "Qwen/Qwen3.5-9B"
   max_concurrent: 16
-  alignment_weight: 1.0
-  physics_weight: 0.5
-  style_weight: 0.5
-  max_frames: 32
+  tile_resolution: 512
+  enable_reason: true
+  reason_thinking_token_budget: 1024  # main thinking-effort knob
+  prompt_preset: "shape"  # tex | shape — gray-clay render needs shape rubric
