@@ -1,79 +1,24 @@
 # ============================================================
-# Trellis2 Tex GRPO LoRA + Qwen-VL Side-by-Side Reward
+# Trellis2 Tex GRPO LoRA + PickScore Text+Image Sum Reward
 # ============================================================
-# This example uses a Qwen native VLM (e.g. Qwen3.5-9B, an
-# omni-modal text+image+video model) as the reward model for
-# 3D texture generation via vLLM's
-# OpenAI-compatible HTTP API.  Each rendered video frame is
-# paired with the input condition image as a side-by-side tile
-# (LEFT = condition, RIGHT = render) and scored via Yes/No first-token
-# logprobs (P(Yes)/(P(Yes)+P(No))).  Training-stage / batch / sampler config is
-# inherited verbatim from `tex_unified_reward.yaml`; only the
-# reward block has been swapped.
+# This example uses a local PickScore-based reward for 3D texture
+# generation. For each sample, rendered video frames are scored against
+# both the text prompt and the input condition image, then frame-level
+# text/image scores are summed. Training-stage / batch / sampler config
+# is inherited verbatim from `tex_unified_reward.yaml`; only the reward
+# block has been swapped.
 #
-# Prerequisites:
-#   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
-#          CUDA_VISIBLE_DEVICES=7 vllm serve Qwen/Qwen3.5-9B \
-#              --served-model-name Qwen/Qwen3.5-9B --host 0.0.0.0 --port 8000 \
-#              --trust-remote-code --gpu-memory-utilization 0.9 \
-#              --enable-prefix-caching \
-#              --reasoning-parser qwen3 \
-#              --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}' \
-#              --limit-mm-per-prompt '{"image": 32}' \
-#              --max-num-seqs 512 --max-model-len 16384
-#      `--reasoning-parser qwen3` is REQUIRED when `enable_reason: true`
-#      so the <think>...</think> block is split into the structured
-#      `message.reasoning` field instead of being inlined into `content`
-#      (otherwise the wandb caption picks up the raw <think> tags and the
-#      reason-conditioned yes/no is fed garbage). Use `qwen3` for the
-#      whole Qwen3 / Qwen3.5 / Qwen3-VL family (vLLM >= 0.9). On older
-#      vLLM (<= 0.8) without a `qwen3` parser, fall back to
-#      `--reasoning-parser deepseek_r1` — both populate the same field.
-#      Note: vLLM >= 0.17 emits the parsed text under `message.reasoning`
-#      (RFC vllm-project/vllm#27755) instead of the older
-#      `message.reasoning_content`; the reward code reads both fields
-#      transparently.
-#      `--reasoning-config` is REQUIRED for the `thinking_token_budget`
-#      knob (see `reason_thinking_token_budget` below). vLLM derives the
-#      <think>/</think> token IDs from this config and refuses requests
-#      that set `thinking_token_budget` without it.
-#      `--enable-prefix-caching` is also mandatory: each sample sends
-#      the SAME image stack twice (reason + yes/no), and prefix caching
-#      is what keeps the visual prefill cost from doubling.
-#   2. Use the remaining GPUs for training (e.g., GPU 0-6):
-#          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/trellis2/tex_qwen_vl_reward.yaml
-#
-# Concurrency budget (must size --max-num-seqs accordingly):
-#   peak_concurrent_requests = world_size * num_workers * max_concurrent
-#   default here = 7 * 4 * 16 = 448  -> --max-num-seqs >= 512 recommended.
-#   Reason and yes/no share the SAME `max_concurrent` semaphore per
-#   process, so peak in-flight requests do not double; throughput per
-#   epoch roughly halves instead. If the server backs up, lower
-#   `num_workers` / `max_concurrent` first before raising `--max-num-seqs`.
+# Run training:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/trellis2/tex_pickscore_image+text.yaml
 #
 # Tuning notes:
-#   - tile_resolution * 2 is the long edge sent to the VLM; raise
-#     it for finer details, lower it to fit token budgets.
-#   - max_frames must satisfy --limit-mm-per-prompt.image >= max_frames.
-#   - enable_reason: true makes scoring thinking-conditioned. Each sample
-#     issues TWO requests: (1) a visible reason via enable_thinking=True,
-#     (2) a 1-token Yes/No conditioned on that same reason. The reason is
-#     also surfaced in wandb captions via RewardProcessor.extra_info.
-#     If the reason call fails / returns blank, the reward substitutes
-#     the sentinel string "[reason failed]" as the assistant turn and
-#     STILL runs the reason-conditioned yes/no — the batch never mixes
-#     two reward semantics, no NaN/mean fill is needed, and the sentinel
-#     surfaces directly in the wandb caption for diagnosis.
-#   - reason_thinking_token_budget is the ONLY knob for Qwen3.5 thinking
-#     effort. vLLM forces </think> once this budget is reached, so the
-#     reason captures real visual judgement instead of running away into
-#     "1. Analyze the request, 2. Identify the numbers, ..." indefinitely.
-#     Defaults to 1024 in code; raise it for harder visual judgement,
-#     lower it (e.g. 512) for cheaper rollouts. The OpenAI-side
-#     ``max_tokens`` is auto-derived as
-#     ``thinking_token_budget + REASON_FINAL_TOKEN_MARGIN`` (256 tokens
-#     reserved for </think> + any short final content) — there is no
-#     separate ``reason_max_tokens`` knob.
+#   - PickScore_TextImage_Sum is a local GPU reward; no vLLM server or
+#     OpenAI-compatible API endpoint is required.
+#   - render_num_frames controls the number of rendered views. Since this
+#     reward sums frame scores rather than averaging them, raw reward scale
+#     grows with the number of frames.
+#   - The text and condition-image similarity terms are both weighted 1.0
+#     in the reward implementation.
 # ============================================================
 
 # Environment Configuration
@@ -191,33 +136,17 @@ eval:
   seed: 42  # Eval seed (defaults to training seed)
 
 # Reward Model Configuration
-# Only meaningful overrides are listed; api_key/max_retries/timeout/max_frames/
-# top_logprobs/canonicalize fall back to QwenVLSideBySideReward defaults.
 rewards:
-  - name: "qwen_vl_side_by_side"
-    reward_model: "qwen_vl_side_by_side"
-    batch_size: 4
-    async_reward: true
-    num_workers: 4
-    api_base_url: "http://localhost:8000/v1"
-    vlm_model: "Qwen/Qwen3.5-9B"
-    max_concurrent: 16
-    tile_resolution: 512
-    enable_reason: false
-    reason_thinking_token_budget: 2048  # main thinking-effort knob
-    prompt_preset: "tex"  # tex | shape — picks the rubric matching this stage's render
+  - name: "pick_score_text_image_sum"
+    reward_model: "PickScore_TextImage_Sum"
+    batch_size: 16
+    device: "cuda"
+    dtype: bfloat16
 
 # Optional Evaluation Reward Models
 eval_rewards:
-  name: "qwen_vl_side_by_side"
-  reward_model: "qwen_vl_side_by_side"
-  batch_size: 4
-  async_reward: true
-  num_workers: 4
-  api_base_url: "http://localhost:8000/v1"
-  vlm_model: "Qwen/Qwen3.5-9B"
-  max_concurrent: 16
-  tile_resolution: 512
-  enable_reason: false
-  reason_thinking_token_budget: 2048  # main thinking-effort knob
-  prompt_preset: "tex"  # tex | shape — picks the rubric matching this stage's render
+  name: "pick_score_text_image_sum"
+  reward_model: "PickScore_TextImage_Sum"
+  batch_size: 16
+  device: "cuda"
+  dtype: bfloat16
