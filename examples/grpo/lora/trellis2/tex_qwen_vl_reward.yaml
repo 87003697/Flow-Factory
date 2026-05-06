@@ -12,15 +12,18 @@
 # reward block has been swapped.
 #
 # Prerequisites:
-#   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
-#          CUDA_VISIBLE_DEVICES=7 vllm serve Qwen/Qwen3.5-9B \
-#              --served-model-name Qwen/Qwen3.5-9B --host 0.0.0.0 --port 8000 \
-#              --trust-remote-code --gpu-memory-utilization 0.9 \
-#              --enable-prefix-caching \
-#              --reasoning-parser qwen3 \
-#              --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}' \
-#              --limit-mm-per-prompt '{"image": 32}' \
-#              --max-num-seqs 512 --max-model-len 16384
+#   1. Install optional Flow-Factory deps for wandb logging and the
+#      OpenAI-compatible vLLM reward client:
+#          pip install -e ".[wandb,remote-reward]"
+#   2. Start a vLLM server on a separate GPU (e.g., GPU 7):
+#  CUDA_VISIBLE_DEVICES=7 vllm serve Qwen/Qwen3.5-9B \
+#      --served-model-name Qwen/Qwen3.5-9B --host 0.0.0.0 --port 8000 \
+#      --trust-remote-code --gpu-memory-utilization 0.9 \
+#      --enable-prefix-caching \
+#      --reasoning-parser qwen3 \
+#      --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}' \
+#      --limit-mm-per-prompt '{"image": 32}' \
+#      --max-num-seqs 512 --max-model-len 16384
 #      `--reasoning-parser qwen3` is REQUIRED when `enable_reason: true`
 #      so the <think>...</think> block is split into the structured
 #      `message.reasoning` field instead of being inlined into `content`

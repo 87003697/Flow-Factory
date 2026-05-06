@@ -38,7 +38,7 @@ Hard rules: see `constraints.md`.
 ```bash
 # Installation
 pip install -e "."              # Core only
-pip install -e ".[all]"         # With DeepSpeed + quantization
+pip install -e ".[all]"         # With DeepSpeed + quantization + wandb + remote rewards
 pip install -e ".[deepspeed]"   # DeepSpeed only
 
 # Training

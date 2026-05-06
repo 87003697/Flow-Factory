@@ -10,7 +10,7 @@ Flow-Factory uses **pip** with `setuptools` as the build backend. Install with:
 
 ```bash
 pip install -e "."              # Core only
-pip install -e ".[all]"         # Core + DeepSpeed + quantization
+pip install -e ".[all]"         # Core + DeepSpeed + quantization + wandb + remote rewards
 pip install -e ".[deepspeed]"   # Core + DeepSpeed only
 ```
 
@@ -24,8 +24,9 @@ pyproject.toml
 │   ├── quantization    bitsandbytes >= 0.45.3
 │   ├── wandb           Weights & Biases tracking
 │   ├── swanlab         SwanLab tracking
+│   ├── remote-reward   OpenAI-compatible HTTP reward client
 │   ├── nvidia          xformers, nvidia-ml-py
-│   └── all             deepspeed + quantization
+│   └── all             deepspeed + quantization + wandb + remote-reward
 └── [tool.*]            black, isort config
 ```
 

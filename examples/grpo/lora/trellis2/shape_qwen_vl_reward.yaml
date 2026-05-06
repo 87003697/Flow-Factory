@@ -18,7 +18,10 @@
 #     color/texture differences.
 #
 # Prerequisites:
-#   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
+#   1. Install optional Flow-Factory deps for wandb logging and the
+#      OpenAI-compatible vLLM reward client:
+#          pip install -e ".[wandb,remote-reward]"
+#   2. Start a vLLM server on a separate GPU (e.g., GPU 7):
 #          CUDA_VISIBLE_DEVICES=7 vllm serve Qwen/Qwen3.5-9B \
 #              --served-model-name Qwen/Qwen3.5-9B --host 0.0.0.0 --port 8000 \
 #              --trust-remote-code --gpu-memory-utilization 0.9 \
@@ -32,7 +35,7 @@
 #      `message.reasoning` AND can enforce `thinking_token_budget`. See
 #      tex_qwen_vl_reward.yaml header for full background on these flags
 #      and on prefix caching.
-#   2. Use the remaining GPUs for training (e.g., GPU 0-6):
+#   3. Use the remaining GPUs for training (e.g., GPU 0-6):
 #          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/grpo/lora/trellis2/shape_qwen_vl_reward.yaml
 #
 # Concurrency budget (must size --max-num-seqs accordingly):

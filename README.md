@@ -114,6 +114,13 @@ Optional dependencies, such as `deepspeed`, are also available. Install them wit
 pip install -e .[deepspeed]
 ```
 
+For configs that use Weights & Biases logging and OpenAI-compatible remote rewards,
+such as the Qwen/vLLM reward examples, install:
+
+```bash
+pip install -e ".[wandb,remote-reward]"
+```
+
 > **Note**: Some models (e.g., LTX-2) require pipeline code not yet released in the official `diffusers` package. For these models, install the bundled diffusers submodule:
 > ```bash
 > git submodule update --init
@@ -122,7 +129,7 @@ pip install -e .[deepspeed]
 
 ## Experiment Trackers
 
-To use [Weights & Biases](https://wandb.ai/site/) or [SwanLab](https://github.com/SwanHubX/SwanLab) to log experimental results, install extra dependencies via `pip install -e .[wandb]` or `pip install -e .[swanlab]`.
+To use [Weights & Biases](https://wandb.ai/site/) or [SwanLab](https://github.com/SwanHubX/SwanLab) to log experimental results, install extra dependencies via `pip install -e .[wandb]` or `pip install -e .[swanlab]`. The `all` extra includes `wandb` and `remote-reward`.
 
 After installation, set corresponding arguments in the config file:
 

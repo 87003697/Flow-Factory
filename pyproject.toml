@@ -68,13 +68,18 @@ quantization = [
 wandb = [ "wandb" ]
 swanlab = [ "swanlab" ]
 
+# OpenAI-compatible HTTP reward servers, such as vLLM-based VLM judges
+remote-reward = [
+    "openai>=1.0.0",
+]
+
 nvidia = [
     "xformers>=0.0.27",
     "nvidia-ml-py",
 ]
 
 all = [
-    "flow-factory[deepspeed,quantization]",
+    "flow-factory[deepspeed,quantization,wandb,remote-reward]",
 ]
 
 [project.scripts]
