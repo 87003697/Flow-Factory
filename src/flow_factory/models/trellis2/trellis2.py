@@ -1086,7 +1086,9 @@ class Trellis2Adapter(BaseAdapter):
         SparseTensor (from inference loops).  ``_build_sparse_inputs``
         handles both cases idempotently.
 
-        ``t`` / ``t_next`` may arrive as:
+        ``t`` / ``t_next`` are in the framework-standard ``[0, 1000]``
+        scheduler scale and are normalised to Trellis2-native ``[0, 1]``
+        internally.  They may arrive as:
           * 0-d tensor — adapter-internal callers (single shared timestep)
           * ``(B,)`` tensor, all equal — GRPO passes ``batch['timesteps'][:, step_idx]``
           * ``(B,)`` tensor, per-sample — NFT passes per-sample timesteps
@@ -1112,6 +1114,11 @@ class Trellis2Adapter(BaseAdapter):
             t = t.unsqueeze(0)                                                # (1,)
         if t_next is not None and t_next.ndim == 0:
             t_next = t_next.unsqueeze(0)                                      # (1,)
+
+        # Convert from framework-standard [0, 1000] to Trellis2-native [0, 1].
+        t = t / 1000.0
+        if t_next is not None:
+            t_next = t_next / 1000.0
 
         t_repr = float(t.float().mean().item())
         t_next_repr = float(t_next.float().mean().item()) if t_next is not None else 0.0
@@ -1665,7 +1672,7 @@ class Trellis2Adapter(BaseAdapter):
         scheduler = self._get_stage_scheduler('dense')
         t_np = scheduler._timesteps_np                                # float64, (steps+1,)
         num_inference_steps = len(t_np) - 1
-        timesteps = torch.tensor(t_np, device=device, dtype=torch.float32)
+        timesteps = torch.tensor(t_np, device=device, dtype=torch.float32) * 1000
 
         latent_collector    = create_trajectory_collector(trajectory_indices, num_inference_steps)
         latent_collector.collect(noise.unsqueeze(0), step_idx=0)

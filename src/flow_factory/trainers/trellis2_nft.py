@@ -31,7 +31,6 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ..samples import BaseSample
 from ..utils.logger_utils import setup_logger
-from ..utils.noise_schedule import TIMESTEP_MAX
 from .nft import DiffusionNFTTrainer
 from .registry import register_trainer
 from .trellis2_mixin import Trellis2TrainerMixin
@@ -95,38 +94,6 @@ class Trellis2NFTTrainer(Trellis2TrainerMixin, DiffusionNFTTrainer):
                 self.accelerator.wait_for_everyone()
 
         return samples
-
-    # ── Timestep scale bridge ─────────────────────────────────────────
-    # Trellis2 scheduler operates in [0, 1] flow time while the NFT base
-    # class (and TimeSampler) expects [0, TIMESTEP_MAX] scheduler scale.
-
-    def _sample_timesteps(self, batch_size: int) -> torch.Tensor:
-        """Sample timesteps, scaling Trellis2's [0,1] discrete grid to [0, TIMESTEP_MAX].
-
-        Non-discrete strategies (uniform, logit_normal) don't use
-        ``scheduler.timesteps`` so they work unmodified.  The discrete
-        strategy needs the scheduler grid, which for Trellis2 lives in
-        ``[0, 1]`` — we scale it to ``[0, TIMESTEP_MAX]`` before
-        calling the base implementation, then restore the original.
-        """
-        if not self.time_sampling_strategy.lower().startswith("discrete"):
-            return super()._sample_timesteps(batch_size)
-
-        orig = self.adapter.scheduler.timesteps
-        try:
-            self.adapter.scheduler.timesteps = orig * TIMESTEP_MAX
-            return super()._sample_timesteps(batch_size)
-        finally:
-            self.adapter.scheduler.timesteps = orig
-
-    def _compute_nft_output(
-        self,
-        batch: Dict[str, Any],
-        timestep: torch.Tensor,
-        noised_latents: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """Convert timestep from [0, TIMESTEP_MAX] → [0, 1] for Trellis2's forward()."""
-        return super()._compute_nft_output(batch, timestep / TIMESTEP_MAX, noised_latents)
 
     # ── Sparse-layout hooks (override) ───────────────────────────────
 

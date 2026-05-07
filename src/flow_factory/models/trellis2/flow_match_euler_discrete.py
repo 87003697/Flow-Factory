@@ -51,8 +51,9 @@ class SparseFlowMatchEulerSDEScheduler(SDESchedulerMixin):
         self._is_eval = False
 
         self._timesteps_np: np.ndarray = np.array([])  # float64
-        self.timesteps: torch.Tensor = torch.tensor([])
-        self.sigmas: torch.Tensor = torch.tensor([])
+        self._timesteps_native: torch.Tensor = torch.tensor([])  # [0, 1]
+        self.timesteps: torch.Tensor = torch.tensor([])  # [0, 1000]
+        self.sigmas: torch.Tensor = torch.tensor([])  # [0, 1]
 
     # ── Time grid ────────────────────────────────────────────────────
 
@@ -61,8 +62,9 @@ class SparseFlowMatchEulerSDEScheduler(SDESchedulerMixin):
         t_seq = np.linspace(1, 0, num_steps + 1)  # float64
         t_seq = self.rescale_t * t_seq / (1 + (self.rescale_t - 1) * t_seq)
         self._timesteps_np = t_seq
-        self.timesteps = torch.from_numpy(t_seq).to(device=device, dtype=torch.float32)
-        self.sigmas = self.timesteps.clone()
+        self._timesteps_native = torch.from_numpy(t_seq).to(device=device, dtype=torch.float32)
+        self.timesteps = self._timesteps_native * 1000
+        self.sigmas = self._timesteps_native.clone()
 
     def get_timesteps_for_loop(self) -> List[int]:
         """Return index list [0, ..., num_steps-1] for inference loop."""
@@ -147,7 +149,7 @@ class SparseFlowMatchEulerSDEScheduler(SDESchedulerMixin):
 
     def get_noise_level_for_timestep(self, timestep):
         t = timestep.item() if isinstance(timestep, torch.Tensor) else timestep
-        idx = int((self.timesteps - t).abs().argmin().item())
+        idx = int((self._timesteps_native - t).abs().argmin().item())
         return self.noise_level if idx in self.current_sde_steps.tolist() else 0.0
 
     def get_noise_level_for_sigma(self, sigma):
@@ -273,10 +275,21 @@ class SparseFlowMatchEulerSDEScheduler(SDESchedulerMixin):
                 noise_level,
                 compute_log_prob,
             )
+        elif dynamics_type == "CPS":
+            return self._step_cps(
+                velocity,
+                t_val,
+                t_next_val,
+                latents,
+                next_latents,
+                generator,
+                noise_level,
+                compute_log_prob,
+            )
         else:
             raise NotImplementedError(
                 f"dynamics_type='{dynamics_type}' not yet implemented for sparse latents. "
-                "Use 'ODE' or 'Flow-SDE'."
+                "Use 'ODE', 'Flow-SDE', or 'CPS'."
             )
 
     # ── ODE step ─────────────────────────────────────────────────────
@@ -387,5 +400,70 @@ class SparseFlowMatchEulerSDEScheduler(SDESchedulerMixin):
                 "log_prob": log_prob,
                 "std_dev_t": torch.tensor(std_dev_scalar),
                 "dt": torch.tensor(dt_scalar),
+            }
+        )
+
+    # ── CPS step ──────────────────────────────────────────────────────
+
+    def _step_cps(
+        self,
+        velocity: SparseTensor,
+        t_val: Union[float, torch.Tensor],
+        t_next_val: Union[float, torch.Tensor],
+        latents: SparseTensor,
+        next_latents: Optional[SparseTensor],
+        generator: Optional[torch.Generator],
+        noise_level: Optional[float],
+        compute_log_prob: bool,
+    ) -> SDESchedulerOutput:
+        """CPS (Consistency Policy Sampling) step with per-point arithmetic.
+
+        Math matches ``FlowMatchEulerDiscreteSDEScheduler.step()`` CPS branch.
+        """
+        sigma = self._expand_to_points(t_val, latents)          # (N, 1)
+        sigma_prev = self._expand_to_points(t_next_val, latents)  # (N, 1)
+
+        if noise_level is None:
+            noise_level = self.get_noise_level_for_timestep(self._scalar_repr(t_val))
+
+        std_dev_t = sigma_prev * math.sin(noise_level * math.pi / 2)  # (N, 1)
+
+        x_feats = latents.feats    # (N, C)
+        v_feats = velocity.feats   # (N, C)
+
+        x0_feats = x_feats - sigma * v_feats                    # (N, C)
+        x1_feats = x_feats + v_feats * (1.0 - sigma)            # (N, C)
+        mean_feats = (
+            x0_feats * (1.0 - sigma_prev)
+            + x1_feats * torch.sqrt(sigma_prev ** 2 - std_dev_t ** 2)
+        )  # (N, C)
+
+        _input_dtype = x_feats.dtype
+
+        if next_latents is None:
+            noise_feats = torch.randn(
+                x_feats.shape,
+                generator=generator,
+                device=x_feats.device,
+                dtype=torch.float32,
+            )  # (N, C)
+            nl_feats = mean_feats + std_dev_t * noise_feats      # (N, C)
+            next_latents_st = latents.replace(feats=nl_feats.to(_input_dtype).float())
+        else:
+            next_latents_st = next_latents
+
+        log_prob = None
+        if compute_log_prob:
+            diff = next_latents_st.feats.detach() - mean_feats   # (N, C)
+            log_prob = -(diff ** 2).mean(dim=-1)                  # (N,)
+
+        return SDESchedulerOutput.from_dict(
+            {
+                "next_latents": next_latents_st,
+                "next_latents_mean": latents.replace(feats=mean_feats),
+                "noise_pred": velocity.feats,
+                "log_prob": log_prob,
+                "std_dev_t": torch.tensor(float(std_dev_t.mean().item())),
+                "dt": torch.tensor(float((sigma_prev - sigma).mean().item())),
             }
         )
