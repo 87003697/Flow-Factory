@@ -1086,11 +1086,14 @@ class Trellis2Adapter(BaseAdapter):
         SparseTensor (from inference loops).  ``_build_sparse_inputs``
         handles both cases idempotently.
 
-        ``t`` / ``t_next`` may arrive as a 0-d tensor (adapter-internal
-        callers) or as a ``(B,)`` tensor (Trainer-style, e.g. GRPO passes
-        ``batch['timesteps'][:, step_idx]``).  Same-t-across-batch is the
-        standard diffusion training assumption also used by Wan / Z-Image
-        adapters, so we just take element 0.
+        ``t`` / ``t_next`` may arrive as:
+          * 0-d tensor — adapter-internal callers (single shared timestep)
+          * ``(B,)`` tensor, all equal — GRPO passes ``batch['timesteps'][:, step_idx]``
+          * ``(B,)`` tensor, per-sample — NFT passes per-sample timesteps
+
+        All three forms are normalised to a ``(B,)`` tensor.  The
+        sparse scheduler's ``_expand_to_points`` handles both scalar and
+        per-sample ``(B,)`` uniformly.
 
         When ``stage`` is None (the typical optimize path where batch
         dict has no ``stage`` key), it is derived from
@@ -1103,39 +1106,40 @@ class Trellis2Adapter(BaseAdapter):
         """
         if stage is None:
             stage = self._training_stage
-        if t.ndim == 1:
-            assert t.eq(t[0]).all(), "Trellis2 requires all samples to share the same timestep."
-            t = t[0]                                                          # 0-d tensor
-        if t_next is not None and t_next.ndim == 1:
-            assert t_next.eq(t_next[0]).all(), "Trellis2 requires all samples to share the same t_next."
-            t_next = t_next[0]                                                # 0-d tensor
-        t_val = float(t.item())
-        t_next_val = float(t_next.item()) if t_next is not None else 0.0
+
+        # Normalise t / t_next to (B,) tensors.
+        if t.ndim == 0:
+            t = t.unsqueeze(0)                                                # (1,)
+        if t_next is not None and t_next.ndim == 0:
+            t_next = t_next.unsqueeze(0)                                      # (1,)
+
+        t_repr = float(t.float().mean().item())
+        t_next_repr = float(t_next.float().mean().item()) if t_next is not None else 0.0
 
         g = self._get_stage_guidance(stage)
         guidance_scale = g['guidance_scale']
         guidance_interval = g['guidance_interval']
         guidance_rescale = g['guidance_rescale']
 
-        apply_cfg = (guidance_interval[0] <= t_val <= guidance_interval[1]
+        apply_cfg = (guidance_interval[0] <= t_repr <= guidance_interval[1]
                      and neg_image_cond is not None and guidance_scale != 1.0)
 
         if stage == 'dense':
             scheduler = self._get_stage_scheduler('dense')
             sigma_min = scheduler._sigma_min
-            pred_pos = self._forward_dense(t_val, latents, image_cond)
+            pred_pos = self._forward_dense(t_repr, latents, image_cond)
             if apply_cfg:
-                pred_neg = self._forward_dense(t_val, latents, neg_image_cond)
+                pred_neg = self._forward_dense(t_repr, latents, neg_image_cond)
                 pred_v = self._apply_cfg_dense(
                     pred_pos.float(), pred_neg.float(), latents.float(),
-                    t_val, guidance_scale, guidance_rescale, sigma_min,
+                    t_repr, guidance_scale, guidance_rescale, sigma_min,
                 )
             else:
                 pred_v = pred_pos.float()
 
             return scheduler.step(
-                noise_pred=pred_v, timestep=t_val * 1000, latents=latents,
-                next_latents=next_latents, timestep_next=t_next_val * 1000,
+                noise_pred=pred_v, timestep=t_repr * 1000, latents=latents,
+                next_latents=next_latents, timestep_next=t_next_repr * 1000,
                 noise_level=noise_level, compute_log_prob=compute_log_prob,
             )
 
@@ -1152,28 +1156,25 @@ class Trellis2Adapter(BaseAdapter):
             B_forward = int(x_t.coords[:, 0].max().item()) + 1                   # scalar int
 
             pred_pos = self._forward_sparse(
-                t_val, x_t, image_cond, concat_cond=concat_cond,
+                t, x_t, image_cond, concat_cond=concat_cond,
                 stage=stage, stage_resolution=stage_resolution,
             )
             if apply_cfg:
                 pred_neg = self._forward_sparse(
-                    t_val, x_t, neg_image_cond, concat_cond=concat_cond,
+                    t, x_t, neg_image_cond, concat_cond=concat_cond,
                     stage=stage, stage_resolution=stage_resolution,
                 )
                 pred_v = self._apply_cfg_sparse(
-                    pred_pos, pred_neg, x_t, t_val, guidance_scale, guidance_rescale, sigma_min,
+                    pred_pos, pred_neg, x_t, t_repr, guidance_scale, guidance_rescale, sigma_min,
                     batch_size=B_forward,
                 )
             else:
                 pred_v = pred_pos
 
-            # Defensive: pred_v.feats should already be fp32 because _build_sparse_inputs
-            # feeds the model with fp32 x_t and SLatFlowModel.forward ends with
-            # manual_cast(h, x.dtype). Kept as a safety net in case the dtype contract changes.
             pred_v = pred_v.replace(feats=pred_v.feats.float())  # (N, C) fp32
 
             output = scheduler.step(
-                pred_v, t_val, t_next_val, x_t,
+                pred_v, t, t_next if t_next is not None else 0.0, x_t,
                 next_latents=sparse['next_latents'],
                 noise_level=noise_level, compute_log_prob=compute_log_prob,
             )
@@ -1298,7 +1299,7 @@ class Trellis2Adapter(BaseAdapter):
 
     def _forward_sparse(
         self,
-        t: float,
+        t: Union[float, torch.Tensor],
         x_t: 'SparseTensor',
         cond: torch.Tensor,
         concat_cond: Optional['SparseTensor'] = None,
@@ -1307,18 +1308,28 @@ class Trellis2Adapter(BaseAdapter):
     ) -> 'SparseTensor':
         """Pure model forward for sparse stage. Returns ``pred_v`` SparseTensor.
 
+        ``t`` may be a Python float (shared timestep) or a ``(B,)`` tensor
+        (per-sample timestep).  The flow model already accepts a ``(B,)``
+        timestep tensor, so both cases are handled uniformly.
+
         Autocast is explicitly disabled so the model's own ``manual_cast``
         handles dtype transitions between float32 head/tail and bf16 blocks.
         No CFG, no scheduler step — the caller handles both.
         """
         device = self.device
+        B = x_t.shape[0]  # batch size from SparseTensor.coords
         if stage == self._training_stage:
             flow_model = self.transformer
         else:
             flow_model = self.pipeline.get_flow_model(stage, stage_resolution)
 
         cond = cond.to(device=device, dtype=torch.float32)
-        t_tensor = torch.full((x_t.shape[0],), 1000 * t, device=device, dtype=torch.float32)  # (B,)
+
+        if isinstance(t, (int, float)):
+            t_tensor = torch.full((B,), 1000 * t, device=device, dtype=torch.float32)  # (B,)
+        else:
+            t_1000 = t.float().to(device) * 1000                                       # (B,) or (1,)
+            t_tensor = t_1000.expand(B)                                                # (B,)
 
         with torch.autocast('cuda', enabled=False):
             pred_v = flow_model(x=x_t, t=t_tensor, cond=cond, concat_cond=concat_cond)

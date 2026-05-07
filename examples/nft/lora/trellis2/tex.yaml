@@ -1,0 +1,164 @@
+# ============================================================
+# Trellis2 Tex DiffusionNFT LoRA + Qwen-VL Side-by-Side Reward
+# ============================================================
+# DiffusionNFT training for the Trellis2 texture stage.
+# Uses the same upstream-stage-sharing protocol as trellis2_grpo
+# but with off-policy NFT matching loss instead of GRPO policy
+# gradient.
+#
+# Prerequisites (same as trellis2 GRPO):
+#   1. Start a vLLM server on a separate GPU (e.g., GPU 7):
+#          CUDA_VISIBLE_DEVICES=7 vllm serve Qwen/Qwen3.5-9B \
+#              --served-model-name Qwen/Qwen3.5-9B --host 0.0.0.0 --port 8000 \
+#              --trust-remote-code --gpu-memory-utilization 0.9 \
+#              --enable-prefix-caching \
+#              --reasoning-parser qwen3 \
+#              --reasoning-config '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}' \
+#              --limit-mm-per-prompt '{"image": 32}' \
+#              --max-num-seqs 512 --max-model-len 16384
+#   2. Use the remaining GPUs for training (e.g., GPU 0-6):
+#          CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 ff-train examples/nft/lora/trellis2/tex.yaml
+# ============================================================
+
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: null  # Path to distributed config file (optional)
+num_processes: 7  # Number of processes to launch (overrides config file)
+main_process_port: 29500
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/trellis2"  # Path to dataset folder (RGBA images + prompts)
+  preprocessing_batch_size: 4  # Batch size for preprocessing
+  dataloader_num_workers: 8  # Number of workers for DataLoader
+  force_reprocess: false  # Force reprocessing of the dataset
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: null  # No limit for production training
+  dataset_type: "image_3d"  # Use Image3DDataset to load RGBA images (alpha = foreground mask)
+  sampler_type: "distributed_group_aligned"  # Scatter K copies across ranks for upstream sharing
+
+# Model Configuration
+model:
+  finetune_type: 'lora'  # Options: full, lora
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"  # Options: all, default, or list of module names
+  model_name_or_path: "pretrained_weights/TRELLIS.2-4B"  # Local path to TRELLIS.2 4B model
+  model_type: "trellis2"
+  resume_path: null  # Path to load previous checkpoint/lora adapter
+  resume_type: null  # Options: lora, full, state. Null to auto-detect based on `finetune_type`
+  # Trellis2-specific
+  target_flow_model: "tex_slat_1024"  # Options: dense, shape_slat_1024, shape_slat_512, tex_slat_1024, tex_slat_512
+  decode_output: true  # Decode latents to mesh and render multiview frames for reward
+  render_num_frames: 16  # Number of views to render per sample
+  render_resolution: 512  # Render resolution in pixels
+  render_bg_color: [0, 0, 0]  # Render background color (RGB, 0-1 float)
+  envmap_path: null  # Path to .exr HDR envmap file (null for default)
+  # Per-stage SDE overrides (consumed by Trellis2Adapter._stage_sde_kwargs)
+  dense_sde:
+    dynamics_type: "ODE"  # Dense stage uses deterministic ODE (not trained)
+  shape_sde:
+    dynamics_type: "ODE"  # Shape stage uses deterministic ODE (upstream, not trained)
+
+log:
+  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  project: "Flow-Factory"  # Project name for logging
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
+  save_freq: 20  # Save frequency in epochs (0 to disable)
+  save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
+
+# Training Configuration
+train:
+  # Trainer settings
+  trainer_type: 'trellis2_nft'  # Trellis2 NFT with upstream stage sharing
+  advantage_aggregation: 'gdpo'  # Options: 'sum', 'gdpo'
+  nft_beta: 1
+  # Off-policy settings
+  off_policy: true  # Use EMA parameters for sampling off-policy data
+  ema_decay_schedule: "piecewise_linear"  # Options: constant, power, linear, piecewise_linear, cosine, warmup_cosine
+  flat_steps: 0
+  ramp_rate: 0.001
+  ema_decay: 0.5  # EMA decay rate (0 to disable)
+  ema_update_interval: 1  # EMA update interval (in epochs)
+  ema_device: "cpu"  # Device to store EMA model (options: cpu, cuda)
+  # Training timestep distribution
+  num_train_timesteps: 2  # Number of timesteps per optimize step
+  time_sampling_strategy: discrete  # Options: uniform, logit_normal, discrete, discrete_with_init, discrete_wo_init
+  time_shift: 3.0
+  timestep_range: 0.7  # Select fraction of timesteps to train on
+  # KL div
+  kl_type: 'v-based'  # Options: 'x-based', 'v-based'
+  kl_beta: 0  # KL divergence beta, 0 to disable
+  ref_param_device: 'cuda'  # Options: cpu, cuda
+  # Clipping
+  adv_clip_range: 5.0  # Advantage clipping range
+
+  # Sampling settings
+  resolution: 1024  # Trellis2 shape/tex conditioning resolution
+  num_inference_steps: 12  # Number of timesteps (Trellis2 typically uses 12)
+
+  # Batch and sampling
+  per_device_batch_size: 2  # Batch size per device (must divide group_size)
+  group_size: 14  # K=14: W*B=14 copies per prompt across 7 GPUs
+  global_std: false  # Use global std for advantage normalization
+  max_epochs: 2000  # Total training epochs
+  unique_sample_num_per_epoch: 4  # 4 unique prompts × K=14 = 56 samples/epoch
+  gradient_step_per_epoch: 4  # Gradient steps per epoch
+  gradient_accumulation_steps: 1
+
+  # Optimizer
+  learning_rate: 3.0e-4  # Initial learning rate
+  adam_weight_decay: 1.0e-4  # AdamW weight decay
+  adam_betas: [0.9, 0.999]  # AdamW betas
+  adam_epsilon: 1.0e-8  # AdamW epsilon
+  max_grad_norm: 1.0  # Max gradient norm for clipping
+
+  # Gradient checkpointing
+  enable_gradient_checkpointing: true  # Enable gradient checkpointing (recommended for Trellis2)
+
+  # Seed
+  seed: 42  # Random seed
+
+# Scheduler Configuration (global defaults for the training stage)
+scheduler:
+  dynamics_type: "ODE"  # NFT uses ODE (decoupled paradigm)
+
+# Evaluation settings
+eval:
+  resolution: 1024  # Evaluation resolution
+  per_device_batch_size: 1  # Eval batch size
+  num_inference_steps: 12  # Number of eval timesteps
+  eval_freq: 20  # Eval frequency in epochs
+  seed: 42  # Eval seed (defaults to training seed)
+
+# Reward Model Configuration
+rewards:
+  - name: "qwen_vl_side_by_side"
+    reward_model: "qwen_vl_side_by_side"
+    batch_size: 4
+    async_reward: true
+    num_workers: 4
+    api_base_url: "http://localhost:8000/v1"
+    vlm_model: "Qwen/Qwen3.5-9B"
+    max_concurrent: 16
+    tile_resolution: 512
+    enable_reason: false
+    reason_thinking_token_budget: 2048
+    prompt_preset: "tex"
+
+# Optional Evaluation Reward Models
+eval_rewards:
+  name: "qwen_vl_side_by_side"
+  reward_model: "qwen_vl_side_by_side"
+  batch_size: 4
+  async_reward: true
+  num_workers: 4
+  api_base_url: "http://localhost:8000/v1"
+  vlm_model: "Qwen/Qwen3.5-9B"
+  max_concurrent: 16
+  tile_resolution: 512
+  enable_reason: false
+  reason_thinking_token_budget: 2048
+  prompt_preset: "tex"
