@@ -816,6 +816,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     'grpo-guard': GRPOTrainingArguments,
     'trellis2_grpo': GRPOTrainingArguments,
     'nft': NFTTrainingArguments,
+    'trellis2_nft': NFTTrainingArguments,
     'awm': AWMTrainingArguments,
     'dgpo': DGPOTrainingArguments,
     'dpo': DPOTrainingArguments,

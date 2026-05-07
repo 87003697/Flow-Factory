@@ -100,6 +100,7 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `grpo-guard` | `GRPOGuardTrainer` | Coupled | `GRPOTrainer` |
 | `dpo` | `DPOTrainer` | Decoupled | `BaseTrainer` |
 | `dgpo` | `DGPOTrainer` | Decoupled | `BaseTrainer` |
+| `trellis2_nft` | `Trellis2NFTTrainer` | Decoupled | `Trellis2TrainerMixin` + `DiffusionNFTTrainer` |
 | `nft` | `DiffusionNFTTrainer` | Decoupled | `BaseTrainer` |
 | `awm` | `AWMTrainer` | Decoupled | `BaseTrainer` |
 
