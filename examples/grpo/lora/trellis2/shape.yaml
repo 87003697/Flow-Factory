@@ -31,7 +31,8 @@ model:
   decode_output: true  # Decode latents to mesh and render multiview frames for reward
   render_num_frames: 24  # Number of views to render per sample
   render_resolution: 512  # Render resolution in pixels
-  render_bg_color: [1, 1, 1]  # Render background color (RGB, 0-1 float)
+  render_mode: "clay"  # Geometry-only gray clay render for shape reward
+  render_bg_color: [0, 0, 0]  # Render background color (RGB, 0-1 float)
   envmap_path: null  # Path to .exr HDR envmap file (null for default)
   # Per-stage SDE overrides (consumed by Trellis2Adapter._stage_sde_kwargs)
   # Shape stage inherits global Flow-SDE defaults — no override needed.

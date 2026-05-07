@@ -45,6 +45,7 @@ _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     "unified_reward_flex_image_pairwise": "flow_factory.rewards.unified_reward_pairwise.UnifiedRewardFlexImagePairwise",
     "unified_reward_flex_video_pairwise": "flow_factory.rewards.unified_reward_pairwise.UnifiedRewardFlexVideoPairwise",
     "qwen_vl_side_by_side": "flow_factory.rewards.qwen_vl_video_reward.QwenVLSideBySideReward",
+    "ao_reward": "flow_factory.rewards.ao_reward.AORewardModel",
 }
 _REWARD_MODEL_REGISTRY = {k.lower(): v for k, v in _REWARD_MODEL_REGISTRY.items()}
 

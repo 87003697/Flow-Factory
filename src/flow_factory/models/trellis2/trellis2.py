@@ -31,6 +31,7 @@ Key Differences from diffusers-based adapters:
 """
 from __future__ import annotations
 
+import gc
 import os
 import sys
 from typing import Union, List, Dict, Any, Optional, Tuple, ClassVar, Literal
@@ -106,6 +107,22 @@ def _composite_rgba_pil(
     bg_rgba = tuple(int(round(c * 255)) for c in bg_color) + (255,)
     bg = Image.new('RGBA', img.size, bg_rgba)
     return Image.alpha_composite(bg, img).convert('RGB')
+
+
+def _fill_dummy_render_outputs(
+    sample: 'Trellis2Sample',
+    num_frames: int,
+    resolution: int,
+) -> None:
+    """Fill a sample with zero render outputs after an OOM skip.
+
+    All-zero ``clay_video`` yields 0.0 from ``AORewardModel`` via
+    ``(clay * mask).sum() / (mask.sum() + eps) == 0``, acting as a
+    maximum penalty without modifying the reward pipeline.
+    """
+    sample.video      = torch.zeros(num_frames, 3, resolution, resolution)  # (T, 3, H, W)
+    sample.clay_video = torch.zeros(num_frames, 1, resolution, resolution)  # (T, 1, H, W)
+    sample.mask_video = torch.zeros(num_frames, 1, resolution, resolution)  # (T, 1, H, W)
 
 
 def _apply_bg_to_condition_images(
@@ -234,6 +251,8 @@ class Trellis2Sample(I2VSample):
     
     # ============ Output (for reward / eval) ============
     mesh: Optional[Any] = None
+    clay_video: Optional[torch.Tensor] = None     # (T, 1, H, W) raw SSAO (1 - occlusion)
+    mask_video: Optional[torch.Tensor] = None     # (T, 1, H, W) geometry-only rasterization mask
 
     _STAGE_FIELD_MAP = {
         'all_latents', 'log_probs', 'image_cond', 'neg_image_cond',
@@ -1443,6 +1462,7 @@ class Trellis2Adapter(BaseAdapter):
         render_num_frames: int = 24,
         render_resolution: int = 512,
         render_bg_color: Tuple[float, float, float] = (0, 0, 0),
+        render_mode: Literal['shaded', 'clay', 'normal'] = 'shaded',
         envmap_path: Optional[str] = None,
         # Pre-created samples (skip stub creation; enables stage-skip)
         samples: Optional[List['Trellis2Sample']] = None,
@@ -1564,16 +1584,27 @@ class Trellis2Adapter(BaseAdapter):
                     bg_color=render_bg_color,
                 )
             envmap = self._build_envmap(envmap_path)
-            samples = [
-                self.render_latents(
-                    s,
-                    num_frames=render_num_frames,
-                    resolution=render_resolution,
-                    bg_color=render_bg_color,
-                    envmap=envmap,
-                )
-                for s in samples
-            ]
+            for i, s in enumerate(samples):
+                try:
+                    samples[i] = self.render_latents(
+                        s,
+                        num_frames=render_num_frames,
+                        resolution=render_resolution,
+                        bg_color=render_bg_color,
+                        render_mode=render_mode,
+                        envmap=envmap,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    logger.warning(
+                        "CUDA OOM in render_latents for sample %d, "
+                        "filling zero dummy tensors (reward will be 0).",
+                        i,
+                    )
+                    _fill_dummy_render_outputs(
+                        s, render_num_frames, render_resolution,
+                    )
 
         return samples
 
@@ -2401,4 +2432,6 @@ class Trellis2Adapter(BaseAdapter):
         frames = (fg + bg * (1 - alpha)).clamp(0, 1).cpu()           # (T, 3, H, W) float32
 
         sample.video = frames
+        sample.clay_video = ret['clay'].cpu()                        # (T, 1, H, W) float32
+        sample.mask_video = ret['mask'].cpu()                        # (T, 1, H, W) float32
         return sample
