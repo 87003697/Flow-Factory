@@ -32,7 +32,7 @@ from ..utils.logger_utils import setup_logger
 from ..utils.trajectory_collector import compute_trajectory_indices
 from .grpo import GRPOTrainer
 from .registry import register_trainer
-from .trellis2_mixin import Trellis2TrainerMixin
+from .trellis2_mixin import Trellis2TrainerMixin, _WindowOOMSkipped
 
 logger = setup_logger(__name__)
 
@@ -79,6 +79,7 @@ class Trellis2GRPOTrainer(Trellis2TrainerMixin, GRPOTrainer):
             )
         num_windows = self.training_args.num_batches_per_epoch // btm
 
+        skipped_windows = 0
         with torch.no_grad(), self.autocast():
             for window_idx in tqdm(
                 range(num_windows),
@@ -87,13 +88,21 @@ class Trellis2GRPOTrainer(Trellis2TrainerMixin, GRPOTrainer):
             ):
                 window_batches = [next(data_iter) for _ in range(btm)]
                 merged_batch = self._merge_batches(window_batches)
-                sample_batch = self._rollout_group(
-                    merged_batch,
-                    trajectory_indices,
-                    compute_log_prob=True,
-                )
+                try:
+                    sample_batch = self._rollout_group(
+                        merged_batch,
+                        trajectory_indices,
+                        compute_log_prob=True,
+                    )
+                except _WindowOOMSkipped:
+                    logger.warning("Window %d skipped due to OOM", window_idx)
+                    skipped_windows += 1
+                    self.accelerator.wait_for_everyone()
+                    continue
                 samples.extend(sample_batch)
                 self.reward_buffer.add_samples(sample_batch)
                 self.accelerator.wait_for_everyone()
 
+        if skipped_windows > 0:
+            self.log_data({"train/skipped_windows": skipped_windows}, step=self.step)
         return samples
