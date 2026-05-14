@@ -124,7 +124,28 @@ class Trellis2TrainerMixin:
                 module._set_static_graph()
                 logger.info(f"Called _set_static_graph() on DDP-wrapped '{name}'")
 
-    # ── Rollout helpers ──────────────────────────────────────────────
+        # FlowEdit config
+        fe_enabled = extra.get("flowedit_enabled", False)
+        if fe_enabled:
+            self._flowedit_cfg = {
+                "fe_steps": extra.get("flowedit_steps", 20),
+                "cfg_scale_src": extra.get("flowedit_cfg_scale_src", -3.0),
+                "cfg_scale_tgt": extra.get("flowedit_cfg_scale_tgt", 5.0),
+                "noise_update": extra.get("flowedit_noise_update", True),
+                "flowedit_use_ref": extra.get("flowedit_use_ref", True),
+            }
+            K = self.training_args.group_size
+            self.advantage_processor.group_size = K * 2
+            self.reward_buffer.group_size = K * 2
+            logger.info(
+                "FlowEdit enabled: reward and advantage group_size doubled %d -> %d",
+                K,
+                K * 2,
+            )
+        else:
+            self._flowedit_cfg = None
+
+    # Rollout helpers
 
     def _rollout_group(
         self,
@@ -175,7 +196,39 @@ class Trellis2TrainerMixin:
             raise _WindowOOMSkipped("OOM during inference stage")
         return result
 
-    # ── Upstream stage sharing ───────────────────────────────────────
+    def _flowedit_group(
+        self,
+        group: List[BaseSample],
+        fe_cfg: Dict[str, Any],
+    ) -> List[BaseSample]:
+        """FlowEdit a group of already-completed samples.  Peer of ``_rollout_group``.
+
+        Raises ``_WindowOOMSkipped`` if any rank hits OOM.
+        """
+        fe_kwargs: Dict[str, Any] = {
+            "stage": self._training_stage,
+            "resolution": self._resolve_rollout_resolution(),
+            "num_inference_steps": self.training_args.num_inference_steps,
+            **self._render_kwargs,
+            **fe_cfg,
+        }
+        fe_kwargs = filter_kwargs(self.adapter.flowedit_inference, **fe_kwargs)
+
+        local_error = False
+        result = None
+        try:
+            result = self.adapter.flowedit_inference(samples=group, **fe_kwargs)
+        except torch.cuda.OutOfMemoryError:
+            self._recover_oom()
+            logger.warning("CUDA OOM during FlowEdit, will skip group")
+            local_error = True
+
+        if self._dist_any_error(local_error):
+            del result
+            raise _WindowOOMSkipped("OOM during FlowEdit")
+        return result
+
+    # Upstream stage sharing
 
     def _distributed_upstream_stages(
         self,

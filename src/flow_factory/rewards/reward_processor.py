@@ -17,41 +17,46 @@
 Unified Reward Processor for handling multiple reward models.
 """
 from __future__ import annotations
-from typing import Dict, Any, Optional, List, Tuple, Set, Union, Literal
-from collections import defaultdict
-from contextlib import nullcontext
-from concurrent.futures import ThreadPoolExecutor, Future
+
 import logging
-import torch
+from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
+
 import numpy as np
+import torch
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
 from accelerate import Accelerator
 
-from .abc import (
-    BaseRewardModel,
-    PointwiseRewardModel,
-    GroupwiseRewardModel,
-    RewardModelOutput,
-)
 from ..hparams import RewardArguments
 from ..samples import BaseSample
-from ..utils.dist import gather_samples
+from ..utils.audio import standardize_audio_batch
 from ..utils.base import filter_kwargs, move_tensors_to_device
+from ..utils.dist import gather_samples
 from ..utils.image import standardize_image_batch
 from ..utils.video import standardize_video_batch
-from ..utils.audio import standardize_audio_batch
+from .abc import BaseRewardModel, GroupwiseRewardModel, PointwiseRewardModel, RewardModelOutput
+
 
 # ============================ Reward Processor ============================
 class RewardProcessor:
     """
     Unified reward processor bound to specific reward models.
-    
+
     Handles both PointwiseRewardModel and GroupwiseRewardModel seamlessly.
     """
-    MEDIA_FIELDS = {'image', 'video', 'audio', 'condition_images', 'condition_videos'} # Fields that may contain media data, requiring format conversion
+
+    MEDIA_FIELDS = {
+        "image",
+        "video",
+        "audio",
+        "condition_images",
+        "condition_videos",
+    }  # Fields that may contain media data, requiring format conversion
 
     def __init__(
         self,
@@ -68,15 +73,13 @@ class RewardProcessor:
         self.tokenizer = tokenizer
         self.group_on_same_rank = group_on_same_rank
         self.verbose = verbose
-        
+
         # Pre-categorize models by type
-        self._pointwise_models : Dict[str, PointwiseRewardModel] = {
-            k: v for k, v in reward_models.items()
-            if isinstance(v, PointwiseRewardModel)
+        self._pointwise_models: Dict[str, PointwiseRewardModel] = {
+            k: v for k, v in reward_models.items() if isinstance(v, PointwiseRewardModel)
         }
-        self._groupwise_models : Dict[str, GroupwiseRewardModel] = {
-            k: v for k, v in reward_models.items()
-            if isinstance(v, GroupwiseRewardModel)
+        self._groupwise_models: Dict[str, GroupwiseRewardModel] = {
+            k: v for k, v in reward_models.items() if isinstance(v, GroupwiseRewardModel)
         }
 
     @property
@@ -87,26 +90,26 @@ class RewardProcessor:
     def _is_async_reward(self, name: str) -> bool:
         """Check if a named reward model is configured for async computation."""
         config = self.reward_configs.get(name)
-        return getattr(config, 'async_reward', False) if config else False
+        return getattr(config, "async_reward", False) if config else False
 
     def _resolve_num_workers(self, name: str) -> int:
         """Resolve the number of concurrent workers for an async reward model."""
         config = self.reward_configs.get(name)
-        return max(1, getattr(config, 'num_workers', 1)) if config else 1
+        return max(1, getattr(config, "num_workers", 1)) if config else 1
 
     def _resolve_batch_size(self, name: str, model: BaseRewardModel) -> int:
         """
         Resolve runtime batch size for a pointwise reward model.
-        
+
         Priority:
             1) Explicit config in `self.reward_configs` for this reward name.
             2) Fallback to shared model config (`model.config.batch_size`).
         """
         batch_size = None
         if name in self.reward_configs:
-            batch_size = getattr(self.reward_configs[name], 'batch_size', None)
+            batch_size = getattr(self.reward_configs[name], "batch_size", None)
         if batch_size is None:
-            batch_size = getattr(model.config, 'batch_size', None)
+            batch_size = getattr(model.config, "batch_size", None)
 
         if not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError(
@@ -117,39 +120,37 @@ class RewardProcessor:
         return batch_size
 
     # ============================ Media Format Conversion ============================
-    def _convert_media_format(self, batch_input: Dict[str, Any], model: BaseRewardModel) -> Dict[str, Any]:
+    def _convert_media_format(
+        self, batch_input: Dict[str, Any], model: BaseRewardModel
+    ) -> Dict[str, Any]:
         """Convert tensor media fields to PIL format (unless model opts out)."""
-        if getattr(model, 'use_tensor_inputs', False):
-            output_type = 'pt'
+        if getattr(model, "use_tensor_inputs", False):
+            output_type = "pt"
         else:
-            output_type = 'pil'
-        
+            output_type = "pil"
+
         result = {}
         for k, v in batch_input.items():
             if k not in self.MEDIA_FIELDS or v is None:
                 result[k] = v
                 continue
-            if k == 'image':
+            if k == "image":
                 result[k] = standardize_image_batch(v, output_type=output_type)
-            elif k == 'video':
+            elif k == "video":
                 result[k] = standardize_video_batch(v, output_type=output_type)
-            elif k == 'audio':
+            elif k == "audio":
                 # Audio has no PIL representation; map 'pil' -> 'np'
-                audio_output = 'pt' if output_type == 'pt' else 'np'
+                audio_output = "pt" if output_type == "pt" else "np"
                 result[k] = standardize_audio_batch(v, output_type=audio_output)
-            elif k == 'condition_images':
+            elif k == "condition_images":
+                result[k] = [standardize_image_batch(imgs, output_type=output_type) for imgs in v]
+            elif k == "condition_videos":
                 result[k] = [
-                    standardize_image_batch(imgs, output_type=output_type)
-                    for imgs in v
-                ]
-            elif k == 'condition_videos':
-                result[k] = [
-                    standardize_video_batch(videos, output_type=output_type)
-                    for videos in v
+                    standardize_video_batch(videos, output_type=output_type) for videos in v
                 ]
 
         return result
-    
+
     # ============================ Single-batch / Single-group Helpers ============================
     def _store_reward_extra_info(
         self,
@@ -205,12 +206,11 @@ class RewardProcessor:
         # via the offload pipeline). Sample objects are not mutated.
         batch_input = move_tensors_to_device(batch_input, model.device)
         output = model(**batch_input)
-        self._store_reward_extra_info(
-            name, batch_samples, getattr(output, "extra_info", None)
-        )
+        self._store_reward_extra_info(name, batch_samples, getattr(output, "extra_info", None))
         return torch.as_tensor(
-            output.rewards if hasattr(output, 'rewards') else output,
-            device='cpu', dtype=torch.float32,
+            output.rewards if hasattr(output, "rewards") else output,
+            device="cpu",
+            dtype=torch.float32,
         )
 
     def _compute_groupwise_group(
@@ -226,12 +226,11 @@ class RewardProcessor:
         group_input = self._convert_media_format(group_input, model)
         group_input = move_tensors_to_device(group_input, model.device)
         output = model(**group_input)
-        self._store_reward_extra_info(
-            name, group_samples, getattr(output, "extra_info", None)
-        )
+        self._store_reward_extra_info(name, group_samples, getattr(output, "extra_info", None))
         return torch.as_tensor(
-            output.rewards if hasattr(output, 'rewards') else output,
-            device='cpu', dtype=torch.float32,
+            output.rewards if hasattr(output, "rewards") else output,
+            device="cpu",
+            dtype=torch.float32,
         )
 
     # ============================ Public API ============================
@@ -240,11 +239,11 @@ class RewardProcessor:
         samples: List[BaseSample],
         store_to_samples: bool = True,
         epoch: Optional[int] = None,
-        split: Literal['pointwise', 'groupwise', 'all'] = 'all',
+        split: Literal["pointwise", "groupwise", "all"] = "all",
     ) -> Dict[str, torch.Tensor]:
         """
         Compute rewards using bound reward models.
-        
+
         Args:
             samples: Local samples on this rank
             store_to_samples: Whether to store rewards in sample.extra_kwargs
@@ -260,21 +259,19 @@ class RewardProcessor:
         results: Dict[str, torch.Tensor] = {}
 
         # Pointwise: local computation
-        if split in ('pointwise', 'all') and self._pointwise_models:
+        if split in ("pointwise", "all") and self._pointwise_models:
             results.update(self._compute_pointwise_rewards(samples, epoch))
-        
+
         # Groupwise: gather -> compute -> scatter
-        if split in ('groupwise', 'all') and self._groupwise_models:
+        if split in ("groupwise", "all") and self._groupwise_models:
             results.update(self._compute_groupwise_rewards(samples, epoch))
 
         self.accelerator.wait_for_everyone()
         # Store to samples
         if store_to_samples:
             for i, sample in enumerate(samples):
-                sample.extra_kwargs['rewards'] = {
-                    k: v[i] for k, v in results.items()
-                }
-        
+                sample.extra_kwargs["rewards"] = {k: v[i] for k, v in results.items()}
+
         return results
 
     # ============================ Pointwise Computation ============================
@@ -287,12 +284,16 @@ class RewardProcessor:
         """Compute rewards for PointwiseRewardModels."""
         models = models if models is not None else self._pointwise_models
         results: Dict[str, torch.Tensor] = {}
-        
+
         for name, model in models.items():
             rewards = []
             batch_size = self._resolve_batch_size(name, model)
 
-            desc = f'Epoch {epoch} Pointwise Rewards: {name}' if epoch is not None else f'Pointwise Rewards: {name}'
+            desc = (
+                f"Epoch {epoch} Pointwise Rewards: {name}"
+                if epoch is not None
+                else f"Pointwise Rewards: {name}"
+            )
             pbar = tqdm(
                 range(0, len(samples), batch_size),
                 desc=desc,
@@ -302,9 +303,9 @@ class RewardProcessor:
                 batch_samples = samples[i : i + batch_size]
                 reward_tensor = self._compute_pointwise_batch(name, model, batch_samples)
                 rewards.append(reward_tensor)
-            
+
             results[name] = torch.cat(rewards, dim=0)
-        
+
         return results
 
     # ============================ Groupwise Computation ============================
@@ -340,7 +341,7 @@ class RewardProcessor:
         all K copies of each prompt reside on the same rank, so we group and
         compute entirely locally.
         """
-        groups, inverse = self.group_samples(samples, key='unique_id', return_inverse=True)
+        groups, inverse = self.group_samples(samples, key="unique_id", return_inverse=True)
         group_keys = list(groups.keys())
 
         # Sanity check: all groups must have the same size (= K)
@@ -355,7 +356,11 @@ class RewardProcessor:
         results: Dict[str, torch.Tensor] = {}
         for name, model in models.items():
             all_rewards = torch.zeros(len(samples), dtype=torch.float32)
-            desc = f'Epoch {epoch} Groupwise Rewards: {name}' if epoch is not None else f'Groupwise Rewards: {name}'
+            desc = (
+                f"Epoch {epoch} Groupwise Rewards: {name}"
+                if epoch is not None
+                else f"Groupwise Rewards: {name}"
+            )
             pbar = tqdm(
                 range(len(group_keys)),
                 desc=desc,
@@ -376,7 +381,7 @@ class RewardProcessor:
 
                 output = model(**group_input)
                 group_rewards = torch.as_tensor(
-                    output.rewards if hasattr(output, 'rewards') else output,
+                    output.rewards if hasattr(output, "rewards") else output,
                     dtype=torch.float32,
                 ).cpu()
                 all_rewards[inverse == group_idx] = group_rewards
@@ -408,10 +413,10 @@ class RewardProcessor:
 
         # Optimize: use prompt_ids instead of prompt strings for communication
         needs_decode = False
-        if 'prompt' in required_fields:
-            if hasattr(samples[0], 'prompt_ids') and samples[0].prompt_ids is not None:
-                required_fields.discard('prompt')
-                required_fields.add('prompt_ids')
+        if "prompt" in required_fields:
+            if hasattr(samples[0], "prompt_ids") and samples[0].prompt_ids is not None:
+                required_fields.discard("prompt")
+                required_fields.add("prompt_ids")
                 needs_decode = True
 
         # 2. Sync and gather samples from all ranks
@@ -430,7 +435,7 @@ class RewardProcessor:
                 s.prompt = prompts[i]
 
         # 3. Group by unique_id and build inverse mapping
-        groups, inverse = self.group_samples(gathered, key='unique_id', return_inverse=True)
+        groups, inverse = self.group_samples(gathered, key="unique_id", return_inverse=True)
         group_keys = list(groups.keys())
         num_gathered = len(gathered)
 
@@ -443,7 +448,11 @@ class RewardProcessor:
         for name, model in models.items():
             # Initialize with zeros - only fill positions this rank computes
             all_rewards = torch.zeros(num_gathered, dtype=torch.float32, device=device)
-            desc = f'Epoch {epoch} Groupwise Rewards: {name}' if epoch is not None else f'Groupwise Rewards: {name}'
+            desc = (
+                f"Epoch {epoch} Groupwise Rewards: {name}"
+                if epoch is not None
+                else f"Groupwise Rewards: {name}"
+            )
             pbar = tqdm(
                 local_group_indices,
                 desc=desc,
@@ -465,23 +474,21 @@ class RewardProcessor:
                 # Compute rewards
                 output = model(**group_input)
                 group_rewards = torch.as_tensor(
-                    output.rewards if hasattr(output, 'rewards') else output,
-                    device=device, dtype=torch.float32,
+                    output.rewards if hasattr(output, "rewards") else output,
+                    device=device,
+                    dtype=torch.float32,
                 )
 
                 # Fill positions belonging to this group
-                mask = (inverse == group_idx)
+                mask = inverse == group_idx
                 all_rewards[mask] = group_rewards
 
             # 6. All-reduce SUM: each position has value from exactly one rank
-            all_rewards = self.accelerator.reduce(all_rewards, reduction='sum')
+            all_rewards = self.accelerator.reduce(all_rewards, reduction="sum")
             results[name] = all_rewards.cpu()
 
         # 7. Scatter back to local rank
-        results = {
-            k: v.chunk(world_size)[rank]
-            for k, v in results.items()
-        }
+        results = {k: v.chunk(world_size)[rank] for k, v in results.items()}
 
         return results
 
@@ -490,11 +497,11 @@ class RewardProcessor:
         """Decode prompt_ids to strings."""
         if self.tokenizer is None:
             raise ValueError("Cannot decode prompts: tokenizer not provided")
-        
+
         return [
             self.tokenizer.decode(
                 ids.cpu().tolist() if isinstance(ids, torch.Tensor) else ids,
-                skip_special_tokens=True
+                skip_special_tokens=True,
             )
             for ids in prompt_ids_list
         ]
@@ -503,35 +510,33 @@ class RewardProcessor:
         """Encode strings to prompt_ids."""
         if self.tokenizer is None:
             raise ValueError("Cannot encode prompts: tokenizer not provided")
-        
+
         return [
-            self.tokenizer(text, return_tensors='pt', padding=False, truncation=True)
-            .input_ids.squeeze(0)
+            self.tokenizer(
+                text, return_tensors="pt", padding=False, truncation=True
+            ).input_ids.squeeze(0)
             for text in prompts
         ]
-    
+
     # ============================ Helper Functions ============================
     @staticmethod
     def compute_group_zero_std_ratio(
-        rewards: np.ndarray, 
-        group_indices: np.ndarray, 
-        eps: float = 1e-6
+        rewards: np.ndarray, group_indices: np.ndarray, eps: float = 1e-6
     ) -> float:
         """
         Compute the fraction of groups with near-zero standard deviation.
-        
+
         Args:
             rewards: Array of reward values
             group_indices: Array mapping each sample to its group
             eps: Threshold for considering std as zero
-            
+
         Returns:
             Fraction of groups with std < eps
         """
         unique_groups = np.unique(group_indices)
         zero_std_count = sum(
-            1 for gid in unique_groups 
-            if np.std(rewards[group_indices == gid]) < eps
+            1 for gid in unique_groups if np.std(rewards[group_indices == gid]) < eps
         )
         return zero_std_count / len(unique_groups)
 
@@ -552,25 +557,25 @@ class RewardProcessor:
             group_stds:  Per-group std of rewards, shape (num_groups,)
         """
         unique_groups = np.unique(group_indices)
-        group_stds  = np.array([np.std(rewards[group_indices == gid])  for gid in unique_groups])
+        group_stds = np.array([np.std(rewards[group_indices == gid]) for gid in unique_groups])
         group_means = np.array([np.mean(rewards[group_indices == gid]) for gid in unique_groups])
         return group_means, group_stds
 
     @staticmethod
     def group_samples(
         samples: List[BaseSample],
-        key: str = 'unique_id',
+        key: str = "unique_id",
         return_inverse: bool = False,
     ) -> Union[Dict[Any, List[BaseSample]], Tuple[Dict[Any, List[BaseSample]], np.ndarray]]:
         """
         Group samples by a key field, similar to np.unique.
-        
+
         Args:
             samples: List of BaseSample instances
             key: Field name to group by (default: 'unique_id')
             return_inverse: If True, return indices to reconstruct original order
             return_index: If True, return first occurrence index for each group
-        
+
         Returns:
             groups: Dict mapping key_value -> List[BaseSample]
             inverse: (optional) Array where inverse[i] gives group index for samples[i]
@@ -578,11 +583,11 @@ class RewardProcessor:
         """
         keys = np.array([getattr(s, key) for s in samples])
         unique_keys, inverse = np.unique(keys, return_inverse=True)
-        
+
         groups: Dict[Any, List[BaseSample]] = {k: [] for k in unique_keys}
         for sample, k in zip(samples, keys):
             groups[k].append(sample)
-        
+
         return (groups, inverse) if return_inverse else groups
 
 
@@ -614,10 +619,18 @@ class RewardBuffer:
 
         # Partition all reward models into async / sync groups based on
         # each model's RewardArguments.async_reward setting.
-        self._async_pointwise = {n: m for n, m in self.rp._pointwise_models.items() if self.rp._is_async_reward(n)}
-        self._sync_pointwise  = {n: m for n, m in self.rp._pointwise_models.items() if not self.rp._is_async_reward(n)}
-        self._async_groupwise = {n: m for n, m in self.rp._groupwise_models.items() if self.rp._is_async_reward(n)}
-        self._sync_groupwise  = {n: m for n, m in self.rp._groupwise_models.items() if not self.rp._is_async_reward(n)}
+        self._async_pointwise = {
+            n: m for n, m in self.rp._pointwise_models.items() if self.rp._is_async_reward(n)
+        }
+        self._sync_pointwise = {
+            n: m for n, m in self.rp._pointwise_models.items() if not self.rp._is_async_reward(n)
+        }
+        self._async_groupwise = {
+            n: m for n, m in self.rp._groupwise_models.items() if self.rp._is_async_reward(n)
+        }
+        self._sync_groupwise = {
+            n: m for n, m in self.rp._groupwise_models.items() if not self.rp._is_async_reward(n)
+        }
         self._has_async = bool(self._async_pointwise or self._async_groupwise)
 
         # Pre-create one CUDA stream per unique device among async models
@@ -625,7 +638,7 @@ class RewardBuffer:
         self._reward_streams: Dict[torch.device, torch.cuda.Stream] = {}
         if self._has_async:
             for m in list(self._async_pointwise.values()) + list(self._async_groupwise.values()):
-                if m.device.type == 'cuda' and m.device not in self._reward_streams:
+                if m.device.type == "cuda" and m.device not in self._reward_streams:
                     self._reward_streams[m.device] = torch.cuda.Stream(device=m.device)
 
         self._init_async_state()
@@ -649,10 +662,7 @@ class RewardBuffer:
         self._pointwise_pending: Dict[str, List[int]] = {n: [] for n in self._async_pointwise}
         self._groupwise_pending: Dict[int, List[int]] = defaultdict(list)
         self._any_cuda_reward = bool(self._reward_streams)
-        total_workers = sum(
-            self.rp._resolve_num_workers(n)
-            for n in async_names
-        )
+        total_workers = sum(self.rp._resolve_num_workers(n) for n in async_names)
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=max(1, total_workers))
         self._futures: List[Tuple[str, List[int], Future]] = []
 
@@ -707,7 +717,7 @@ class RewardBuffer:
     def finalize(
         self,
         store_to_samples: bool = True,
-        split: Literal['pointwise', 'groupwise', 'all'] = 'all',
+        split: Literal["pointwise", "groupwise", "all"] = "all",
     ) -> Dict[str, torch.Tensor]:
         """Complete all reward computation and return the merged result dict.
 
@@ -722,10 +732,14 @@ class RewardBuffer:
         results: Dict[str, torch.Tensor] = {}
 
         # 1. Compute sync rewards (blocking, on main thread)
-        if split in ('pointwise', 'all') and self._sync_pointwise:
-            results.update(self.rp._compute_pointwise_rewards(self.all_samples, models=self._sync_pointwise))
-        if split in ('groupwise', 'all') and self._sync_groupwise:
-            results.update(self.rp._compute_groupwise_rewards(self.all_samples, models=self._sync_groupwise))
+        if split in ("pointwise", "all") and self._sync_pointwise:
+            results.update(
+                self.rp._compute_pointwise_rewards(self.all_samples, models=self._sync_pointwise)
+            )
+        if split in ("groupwise", "all") and self._sync_groupwise:
+            results.update(
+                self.rp._compute_groupwise_rewards(self.all_samples, models=self._sync_groupwise)
+            )
 
         # 2. Flush and collect async rewards
         if self._has_async:
@@ -737,7 +751,7 @@ class RewardBuffer:
         # 3. Store to samples
         if store_to_samples:
             for i, sample in enumerate(self.all_samples):
-                sample.extra_kwargs['rewards'] = {k: v[i] for k, v in results.items()}
+                sample.extra_kwargs["rewards"] = {k: v[i] for k, v in results.items()}
 
         return results
 
@@ -755,7 +769,7 @@ class RewardBuffer:
         with ctx:
             if sync_event is not None and stream is not None:
                 stream.wait_event(sync_event)
-            if task_type == 'pointwise':
+            if task_type == "pointwise":
                 return self.rp._compute_pointwise_batch(name, model, samples)
             else:
                 return self.rp._compute_groupwise_group(name, model, samples)
@@ -783,7 +797,12 @@ class RewardBuffer:
                 pending = self._pointwise_pending[name]
                 batch_samples = [self.all_samples[i] for i in batch_idx]
                 future = self._executor.submit(
-                    self._execute_task, 'pointwise', name, model, batch_samples, sync_event,
+                    self._execute_task,
+                    "pointwise",
+                    name,
+                    model,
+                    batch_samples,
+                    sync_event,
                 )
                 self._futures.append((name, batch_idx, future))
         # Groupwise: dispatch complete groups
@@ -792,7 +811,12 @@ class RewardBuffer:
                 group_samples = [self.all_samples[i] for i in indices]
                 for name, model in self._async_groupwise.items():
                     future = self._executor.submit(
-                        self._execute_task, 'groupwise', name, model, group_samples, sync_event,
+                        self._execute_task,
+                        "groupwise",
+                        name,
+                        model,
+                        group_samples,
+                        sync_event,
                     )
                     self._futures.append((name, list(indices), future))
                 del self._groupwise_pending[uid]
@@ -821,7 +845,12 @@ class RewardBuffer:
             if pending:
                 batch_samples = [self.all_samples[i] for i in pending]
                 future = self._executor.submit(
-                    self._execute_task, 'pointwise', name, model, batch_samples, sync_event,
+                    self._execute_task,
+                    "pointwise",
+                    name,
+                    model,
+                    batch_samples,
+                    sync_event,
                 )
                 self._futures.append((name, list(pending), future))
                 self._pointwise_pending[name] = []
@@ -831,7 +860,7 @@ class RewardBuffer:
         completed = 0
         with tqdm(
             total=total,
-            desc='Async Rewards',
+            desc="Async Rewards",
             disable=not self.rp.show_progress_bar,
         ) as pbar:
             for name, indices, future in self._futures:
@@ -842,17 +871,17 @@ class RewardBuffer:
                 pbar.n = completed
                 pbar.refresh()
         # 3. Verify all groupwise groups completed
-        assert len(self._groupwise_pending) == 0, (
-            f"Incomplete groups remaining: {list(self._groupwise_pending.keys())}"
-        )
+        assert (
+            len(self._groupwise_pending) == 0
+        ), f"Incomplete groups remaining: {list(self._groupwise_pending.keys())}"
         # 4. Synchronize CUDA streams
         for stream in self._reward_streams.values():
             stream.synchronize()
         # 5. Assemble results
         results: Dict[str, torch.Tensor] = {}
         for name, reward_list in self._rewards.items():
-            assert all(r is not None for r in reward_list), (
-                f"Missing rewards for async model '{name}'"
-            )
+            assert all(
+                r is not None for r in reward_list
+            ), f"Missing rewards for async model '{name}'"
             results[name] = torch.stack(reward_list)
         return results

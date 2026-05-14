@@ -55,6 +55,16 @@ model:
   render_resolution: 512  # Render resolution in pixels
   render_bg_color: [0, 0, 0]  # Render background color (RGB, 0-1 float)
   envmap_path: null  # Path to .exr HDR envmap file (null for default)
+  # FlowEdit augmentation: generates K edited copies alongside K original samples.
+  # When enabled, advantage_processor.group_size is automatically doubled (2K per group).
+  # cfg_scale formula: v_cfg = (1 + cfg_scale) * v_cond - cfg_scale * v_uncond
+  # tex guidance_scale=1.0 (no amplification) maps to cfg_scale=0; src/tgt symmetric around 0.
+  flowedit_enabled: true
+  flowedit_steps: 12              # Timesteps; set equal to num_inference_steps (all steps run)
+  flowedit_cfg_scale_src: -1.0    # Source branch: pure v_uncond (guidance_scale=0)
+  flowedit_cfg_scale_tgt: 1.0     # Target branch: guidance_scale=2, mild amplification
+  flowedit_noise_update: true     # RF-Edit style; set false for standard FlowEdit ablation
+  flowedit_use_ref: true          # true = frozen pretrained ref; false = EMA weights (ablation)
   # Per-stage SDE overrides (consumed by Trellis2Adapter._stage_sde_kwargs)
   dense_sde:
     dynamics_type: "ODE"  # Dense stage uses deterministic ODE (not trained)

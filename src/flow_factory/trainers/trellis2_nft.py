@@ -21,6 +21,7 @@ Uses ``Trellis2TrainerMixin`` for multi-stage rollout logic and inherits
 hooks so that the base-class optimize loop handles Trellis2's
 ``(N_total, C)`` sparse latents correctly.
 """
+from contextlib import nullcontext
 from functools import partial
 from typing import Any, Dict, List
 
@@ -53,7 +54,7 @@ class Trellis2NFTTrainer(Trellis2TrainerMixin, DiffusionNFTTrainer):
         super().__init__(**kwargs)
         self._init_trellis2()
 
-    # ── Sampling (override) ──────────────────────────────────────────
+    # Sampling (override)
 
     def sample(self) -> List[BaseSample]:
         """Generate rollouts with cross-GPU upstream stage sharing.
@@ -102,9 +103,81 @@ class Trellis2NFTTrainer(Trellis2TrainerMixin, DiffusionNFTTrainer):
 
         if skipped_windows > 0:
             self.log_data({"train/skipped_windows": skipped_windows}, step=self.step)
+
+        # FlowEdit phase
+        if self._flowedit_cfg is not None:
+            edited = self._sample_flowedit(samples)
+            if edited:
+                samples.extend(edited)
+
         return samples
 
-    # ── Sparse-layout hooks (override) ───────────────────────────────
+    def _sample_flowedit(
+        self,
+        original_samples: List[BaseSample],
+    ) -> List[BaseSample]:
+        """Generate FlowEdit-edited copies of original samples.
+
+        Mirrors the structure of the ODE rollout loop in ``sample()``:
+        iterate groups, call ``_flowedit_group`` (peer of ``_rollout_group``),
+        offload, buffer, sync.
+
+        Implements all-or-nothing OOM recovery: if any group fails, all
+        successfully edited samples are discarded to maintain a uniform
+        ``advantage_processor.group_size`` across the epoch.
+        """
+        K = self.training_args.group_size
+        self.advantage_processor.group_size = K * 2
+        self.reward_buffer.group_size = K * 2
+        edited_all: List[BaseSample] = []
+        skipped_groups = 0
+
+        self.adapter.rollout()
+        use_ref = self._flowedit_cfg.get("flowedit_use_ref", True)
+        fe_ctx = self.adapter.use_ref_parameters() if use_ref else nullcontext()
+        with torch.no_grad(), self.autocast(), fe_ctx:
+            for group_idx in tqdm(
+                range(0, len(original_samples), K),
+                desc=f"Epoch {self.epoch} FlowEdit",
+                disable=not self.show_progress_bar,
+            ):
+                # Pass samples directly: _inference_flowedit already moves every
+                # needed field (sparse_coords, latents, conditioning) to device
+                # explicitly, so calling s.to(device) here would incorrectly move
+                # sample.video (CPU from render_mesh) to GPU, causing a
+                # device mismatch with FlowEdit samples whose video stays on CPU.
+                group = original_samples[group_idx : group_idx + K]
+                try:
+                    edited_group = self._flowedit_group(group, self._flowedit_cfg)
+                except _WindowOOMSkipped:
+                    logger.warning("FlowEdit group %d skipped due to OOM", group_idx // K)
+                    skipped_groups += 1
+                    self.accelerator.wait_for_everyone()
+                    continue
+                self._maybe_offload_samples_to_cpu(edited_group)
+                edited_all.extend(edited_group)
+                self.accelerator.wait_for_everyone()
+
+        if skipped_groups > 0:
+            # All-or-nothing: partial FlowEdit would cause group_size mismatch
+            # in advantage_processor and reward_buffer (expects uniform K*2 per group).
+            logger.warning(
+                "%d FlowEdit groups failed; discarding all %d edited samples "
+                "to maintain uniform group_size=%d",
+                skipped_groups,
+                len(edited_all),
+                self.training_args.group_size,
+            )
+            self.advantage_processor.group_size = self.training_args.group_size
+            self.reward_buffer.group_size = self.training_args.group_size
+            self.reward_buffer.clear()
+            self.reward_buffer.add_samples(original_samples)
+            self.log_data({"train/flowedit_skipped_groups": skipped_groups}, step=self.step)
+            return []
+        self.reward_buffer.add_samples(edited_all)
+        return edited_all
+
+    # Sparse-layout hooks (override)
 
     def _get_optimize_batch_size(self, batch: Dict[str, Any]) -> int:
         """Infer B from sparse_coords (shape[0] of all_latents is N_total)."""
@@ -128,8 +201,12 @@ class Trellis2NFTTrainer(Trellis2TrainerMixin, DiffusionNFTTrainer):
         """Scatter-mean per-point ``(N_total,)`` loss to per-sample ``(B,)``."""
         batch_idx = batch["sparse_coords"][:, 0].long()  # (N_total,)
         B = int(batch_idx.max().item()) + 1
-        per_sample = torch.zeros(B, device=per_element_loss.device, dtype=per_element_loss.dtype)
-        counts = torch.zeros(B, device=per_element_loss.device, dtype=per_element_loss.dtype)
-        per_sample.scatter_add_(0, batch_idx, per_element_loss)
-        counts.scatter_add_(0, batch_idx, torch.ones_like(per_element_loss))
-        return per_sample / counts.clamp(min=1)
+        per_sample = torch.zeros(
+            B, device=per_element_loss.device, dtype=per_element_loss.dtype
+        )  # (B,)
+        counts = torch.zeros(
+            B, device=per_element_loss.device, dtype=per_element_loss.dtype
+        )  # (B,)
+        per_sample.scatter_add_(0, batch_idx, per_element_loss)  # (B,)
+        counts.scatter_add_(0, batch_idx, torch.ones_like(per_element_loss))  # (B,)
+        return per_sample / counts.clamp(min=1)  # (B,)

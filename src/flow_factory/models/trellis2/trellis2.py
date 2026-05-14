@@ -1717,6 +1717,280 @@ class Trellis2Adapter(BaseAdapter):
         kwargs.setdefault("training_stage", "tex")
         return self.inference(**kwargs)
 
+    # ======================== FlowEdit Methods ========================
+
+    @torch.no_grad()
+    def _inference_flowedit(
+        self,
+        samples: List["Trellis2Sample"],
+        image_cond: List[torch.Tensor],
+        neg_image_cond: List[torch.Tensor],
+        stage: str = "shape",
+        resolution: int = 1024,
+        fe_steps: int = 20,
+        cfg_scale_src: float = -3.0,
+        cfg_scale_tgt: float = 5.0,
+        noise_update: bool = True,
+    ) -> List["Trellis2Sample"]:
+        """Apply FlowEdit differential editing on clean latents from ODE rollout.
+
+        Peer of ``_inference_shape`` / ``_inference_tex``: implements a complete
+        FlowEdit sampling loop using the same flow model with differential CFG.
+        The source branch uses negative/weak CFG (suppresses conditioning); the
+        target branch amplifies it (stronger CFG).
+
+        All ``fe_steps`` steps are executed (no partial-trajectory gating).
+        Set ``fe_steps`` equal to ``num_inference_steps`` so the t-grid and
+        edit coverage are consistent with the ODE rollout schedule.
+
+        Args:
+            samples: Completed samples with final latents on CPU or GPU.
+            image_cond: Per-sample conditioning tensors (seq, D).
+            neg_image_cond: Per-sample negative conditioning tensors.
+            stage: Which stage to edit ('shape' or 'tex').
+            resolution: Stage resolution in pixels.
+            fe_steps: Number of timesteps; should equal num_inference_steps.
+            cfg_scale_src: CFG scale for source branch (negative suppresses cond).
+            cfg_scale_tgt: CFG scale for target branch (positive amplifies cond).
+            noise_update: If True, update the shared noise after each step to
+                maintain source/target trajectory consistency (RF-Edit variant).
+                Set False for standard fixed-noise FlowEdit ablation.
+
+        Returns:
+            New Trellis2Sample objects with edited latents; originals not mutated.
+        """
+        from .flow_match_euler_discrete import SparseFlowMatchEulerSDEScheduler
+
+        if stage not in ("shape", "tex"):
+            raise ValueError(f"FlowEdit unsupported stage: {stage!r}")
+
+        device = self.device
+
+        # Batch assembly (inline, mirrors _inference_shape/_tex)
+        coords_list: List[torch.Tensor] = []
+        feats_list: List[torch.Tensor] = []
+        concat_cond_list: List[torch.Tensor] = []
+        for b, s in enumerate(samples):
+            if s.sparse_coords is None:
+                raise ValueError(
+                    f"sample[{b}].sparse_coords is None. " "Run the dense stage first."
+                )
+            coords_list.append(s.sparse_coords.to(device))  # (N_b, 4)
+            if stage == "shape":
+                feats_list.append(s.shape_final_latent.to(device))  # (N_b, C)
+            else:
+                feats_list.append(s.tex_final_latent.to(device))  # (N_b, C)
+                concat_cond_list.append(
+                    s.tex_concat_cond.to(device=device, dtype=torch.float32)
+                )  # (N_b, C_shape)
+
+        x_src = SparseTensor.from_tensor_list(feats_list, coords_list)
+        cond = torch.stack(
+            [c.to(device=device, dtype=torch.float32) for c in image_cond],
+            dim=0,
+        )  # (B, seq, D)
+        neg_cond = torch.stack(
+            [c.to(device=device, dtype=torch.float32) for c in neg_image_cond],
+            dim=0,
+        )  # (B, seq, D)
+        concat_cond = None
+        if stage == "tex":
+            concat_cond = x_src.replace(
+                feats=torch.cat(concat_cond_list, dim=0),  # (N_total, C_shape)
+            )
+
+        z_edit_feats = x_src.feats.clone()  # (N_total, C)
+        noise = torch.randn_like(x_src.feats)  # (N_total, C)
+
+        orig_scheduler = self._get_stage_scheduler(stage)
+        scheduler = SparseFlowMatchEulerSDEScheduler(
+            rescale_t=orig_scheduler.rescale_t,
+        )
+        scheduler.set_timesteps(fe_steps, device=x_src.feats.device)
+        steps = scheduler.get_timesteps_for_loop()
+
+        # FlowEdit differential loop (all steps)
+        for i in steps:
+            t_val = scheduler.get_precise_t(i)
+            t_prev_val = scheduler.get_precise_t(i + 1)
+            dt = t_prev_val - t_val  # < 0
+
+            # Source branch
+            src_feats = (1 - t_val) * x_src.feats + t_val * noise  # (N_total, C)
+            latents_src = x_src.replace(feats=src_feats)
+
+            v_cond_src = self._forward_sparse(
+                t_val,
+                latents_src,
+                cond,
+                concat_cond=concat_cond,
+                stage=stage,
+                stage_resolution=resolution,
+            )
+            v_uncond_src = self._forward_sparse(
+                t_val,
+                latents_src,
+                neg_cond,
+                concat_cond=concat_cond,
+                stage=stage,
+                stage_resolution=resolution,
+            )
+            v_cfg_src_feats = (
+                1 + cfg_scale_src
+            ) * v_cond_src.feats - cfg_scale_src * v_uncond_src.feats  # (N_total, C)
+
+            # Target branch (aligned noise)
+            tgt_feats = z_edit_feats + (src_feats - x_src.feats)  # (N_total, C)
+            latents_tgt = x_src.replace(feats=tgt_feats)
+
+            v_cond_tgt = self._forward_sparse(
+                t_val,
+                latents_tgt,
+                cond,
+                concat_cond=concat_cond,
+                stage=stage,
+                stage_resolution=resolution,
+            )
+            v_uncond_tgt = self._forward_sparse(
+                t_val,
+                latents_tgt,
+                neg_cond,
+                concat_cond=concat_cond,
+                stage=stage,
+                stage_resolution=resolution,
+            )
+            v_cfg_tgt_feats = (
+                1 + cfg_scale_tgt
+            ) * v_cond_tgt.feats - cfg_scale_tgt * v_uncond_tgt.feats  # (N_total, C)
+
+            # Differential Euler step: update edited latent with velocity difference
+            v_delta = v_cfg_tgt_feats - v_cfg_src_feats  # (N_total, C)
+            z_edit_feats = z_edit_feats + dt * v_delta  # (N_total, C)
+
+            # RF-Edit style noise update: improves trajectory consistency.
+            # Set noise_update=False for standard fixed-noise FlowEdit ablation.
+            if noise_update:
+                noise = noise - (v_cond_tgt.feats - v_uncond_tgt.feats) * (
+                    1.0 - t_val
+                )  # (N_total, C)
+
+        # Split back to per-sample and build new Trellis2Sample objects
+        edited_feats_list, _ = x_src.replace(feats=z_edit_feats).to_tensor_list()
+
+        edited_samples = []
+        for b, s in enumerate(samples):
+            feats_b = edited_feats_list[b]  # (N_b, C)
+            traj_b = feats_b.unsqueeze(0)  # (1, N_b, C)
+            if stage == "shape":
+                edited = s.copy_and_replace(
+                    shape_final_latent=feats_b,
+                    shape_all_latents=traj_b,
+                )
+            else:
+                edited = s.copy_and_replace(
+                    tex_final_latent=feats_b,
+                    tex_all_latents=traj_b,
+                )
+            edited.activate_stage(stage)
+            edited_samples.append(edited)
+        return edited_samples
+
+    @torch.no_grad()
+    def flowedit_inference(
+        self,
+        samples: List["Trellis2Sample"],
+        stage: str,
+        resolution: int = 1024,
+        fe_steps: int = 20,
+        cfg_scale_src: float = -3.0,
+        cfg_scale_tgt: float = 5.0,
+        noise_update: bool = True,
+        num_inference_steps: int = 50,
+        decode_output: bool = False,
+        render_num_frames: int = 24,
+        render_resolution: int = 512,
+        render_bg_color: Tuple[float, float, float] = (0, 0, 0),
+        render_mode: Literal["shaded", "clay", "normal"] = "shaded",
+        envmap_path: Optional[str] = None,
+    ) -> List["Trellis2Sample"]:
+        """FlowEdit inference: edit latents -> downstream stages -> decode/render.
+
+        High-level entry point parallel to ``inference()``.  Takes already-
+        completed samples (from ODE rollout) and applies FlowEdit differential
+        editing on the specified stage, then runs any downstream stages and
+        optionally decodes to mesh + renders.
+
+        Args:
+            samples: Completed samples on GPU (from ODE rollout).
+            stage: Which stage to apply FlowEdit on ('shape' or 'tex').
+            fe_steps / cfg_scale_src / cfg_scale_tgt: FlowEdit hyperparams.
+            noise_update: RF-Edit style noise update; set False for ablation.
+            decode_output: If True, decode + render after FlowEdit.
+        """
+        resolution = self._as_scalar_resolution(resolution)
+
+        # 1. Extract conditioning from completed samples
+        if stage == "shape":
+            image_cond = [s.shape_image_cond for s in samples]
+            neg_image_cond = [s.shape_neg_image_cond for s in samples]
+        else:
+            image_cond = [s.tex_image_cond for s in samples]
+            neg_image_cond = [s.tex_neg_image_cond for s in samples]
+
+        # 2. FlowEdit on the training stage
+        edited = self._inference_flowedit(
+            samples=samples,
+            image_cond=image_cond,
+            neg_image_cond=neg_image_cond,
+            stage=stage,
+            resolution=resolution,
+            fe_steps=fe_steps,
+            cfg_scale_src=cfg_scale_src,
+            cfg_scale_tgt=cfg_scale_tgt,
+            noise_update=noise_update,
+        )
+
+        # 3. Downstream stages (shape edit -> run tex)
+        if stage == "shape":
+            tex_cond = [
+                s.tex_image_cond if s.tex_image_cond is not None else s.shape_image_cond
+                for s in edited
+            ]
+            tex_neg_cond = [
+                s.tex_neg_image_cond if s.tex_neg_image_cond is not None else s.shape_neg_image_cond
+                for s in edited
+            ]
+            ss_resolution = 32 if resolution <= 512 else 64
+            self._run_stage_inference(
+                "tex",
+                edited,
+                image_cond=tex_cond,
+                neg_image_cond=tex_neg_cond,
+                resolution=resolution,
+                num_inference_steps=num_inference_steps,
+                generator=None,
+                trajectory_indices=[-1],
+                extra_call_back_kwargs=[],
+                ss_resolution=ss_resolution,
+                is_training_stage=False,
+                compute_log_prob=False,
+            )
+
+        # 4. Decode + render (same logic as inference())
+        if decode_output:
+            envmap = self._build_envmap(envmap_path)
+            for i, s in enumerate(edited):
+                edited[i] = self.render_latents(
+                    s,
+                    num_frames=render_num_frames,
+                    resolution=render_resolution,
+                    bg_color=render_bg_color,
+                    render_mode=render_mode,
+                    envmap=envmap,
+                )
+
+        return edited
+
     def _decode_dense_to_coords(
         self,
         z_s: torch.Tensor,  # (B, C, D, H, W) dense structure latent
