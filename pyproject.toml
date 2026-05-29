@@ -30,7 +30,7 @@ dependencies = [
     "torchaudio>=2.4.0",
     
     # Hugging Face Ecosystem
-    "transformers>=4.57.1",  # Compatible with both v4.x and v5.x
+    "transformers>=4.57.1,<5.0",  # Pin to 4.x — TRELLIS.2 image_feature_extractor uses DINOv3 internals (.layer) incompatible with 5.x
     "diffusers>=0.36.0",
     "accelerate>=1.11.0",
     "peft>=0.17.0",

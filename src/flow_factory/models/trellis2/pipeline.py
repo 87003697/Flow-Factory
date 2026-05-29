@@ -252,7 +252,14 @@ class Trellis2PseudoPipeline:
             rembg_cfg = args['rembg_model']
             if isinstance(rembg_cfg, str):
                 rembg_cfg = {'name': rembg_cfg, 'args': {}}
-            rembg_model = cls._instantiate(rembg, rembg_cfg, path_override=rembg_model_path)
+            try:
+                rembg_model = cls._instantiate(rembg, rembg_cfg, path_override=rembg_model_path)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Failed to load rembg model (not needed for RGBA training): {e}"
+                )
+                rembg_model = None
 
         return cls(
             models=_models,
