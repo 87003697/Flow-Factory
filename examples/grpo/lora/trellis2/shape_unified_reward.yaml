@@ -26,12 +26,17 @@ mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/trellis2"  # Path to dataset folder (RGBA images + prompts)
+  datasets:
+    - name: default
+      dataset_dir: "dataset/trellis2"  # Path to dataset folder (RGBA images + prompts)
+      train:
+        weight: 1
+        max_dataset_size: null  # No limit for production training
+      eval: {}
   preprocessing_batch_size: 4  # Batch size for preprocessing
   dataloader_num_workers: 8  # Number of workers for DataLoader
   force_reprocess: false  # Force reprocessing of the dataset
   cache_dir: "/data/zhiyuan_ma/.cache/flow_factory/datasets"  # Cache on /data (2.8T free)
-  max_dataset_size: null  # No limit for production training
   dataset_type: "image_3d"  # Use Image3DDataset to load RGBA images (alpha = foreground mask)
   sampler_type: "distributed_group_aligned"  # Scatter K copies of each prompt across ranks within one global iteration (load-balanced); enables Trellis2 cross-GPU upstream stage sharing without requiring K % W == 0
 
