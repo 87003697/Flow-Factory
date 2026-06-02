@@ -21,7 +21,7 @@ import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, ClassVar, Dict, Iterable, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -112,7 +112,32 @@ class BaseSample:
     negative_prompt: Optional[str] = None
     negative_prompt_ids: Optional[torch.Tensor] = None
     negative_prompt_embeds: Optional[torch.Tensor] = None
+
+    # --- Multi-source training bookkeeping ---
+    # Populated by `BaseTrainer._inject_batch_metadata` for every sample
+    # produced under `data.datasets`. Both fields are None in legacy
+    # single-source mode (no `data.datasets`); the reward gate treats
+    # `source_id is None` as "applies to every reward" so byte-identical
+    # legacy behavior is preserved.
+    #
+    # `source` is the human-readable name (used for log keys / metric prefixes /
+    # debugging); `source_id` is the small monotonic int assigned by
+    # `Arguments._assign_source_ids` and is the form used in hot-path
+    # comparisons (set membership in `RewardArguments._datasets_resolved`,
+    # cross-rank gather of an int8/int16 vector instead of strings).
+    source: Optional[str] = field(default=None, repr=False, compare=False)
+    source_id: Optional[int] = field(default=None, repr=False, compare=False)
+
     extra_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    # Set of reward names that COULD have applied to this sample given
+    # the current routing config (i.e. whose ``RewardArguments.applicable_datasets``
+    # contained this sample's ``source``, or was None).  Populated
+    # by ``RewardProcessor`` whenever a reward is computed.  Read by
+    # ``AdvantageProcessor`` to aggregate authoritatively rather than
+    # relying on ``np.isnan`` (which would silently mask in-model NaN
+    # bugs).  See plan §6 for the design.
+    applicable_rewards: Set[str] = field(default_factory=set, repr=False, compare=False)
 
     _unique_id: Optional[int] = field(default=None, repr=False, compare=False)
 
@@ -196,7 +221,16 @@ class BaseSample:
         return cls(**known, extra_kwargs=extra)
 
     def __getattr__(self, key: str) -> Any:
-        """Access attributes. Check extra_kwargs if not found."""
+        """Access attributes. Check extra_kwargs if not found.
+
+        Note for callers: do NOT use ``object.__getattribute__(sample, ...)``
+        to bypass this fallback — plain ``sample.<key>`` already does the
+        right thing (real dataclass fields short-circuit before this method
+        runs; only "missing" lookups fall through to ``extra_kwargs``).
+        ``object.__getattribute__`` is appropriate ONLY inside this method
+        body to avoid infinite recursion when reading ``extra_kwargs``
+        itself.
+        """
         try:
             extra = object.__getattribute__(self, "extra_kwargs")
         except AttributeError:
@@ -408,12 +442,16 @@ class BaseSample:
         if not samples:
             raise ValueError("No samples to stack.")
 
-        sample_cls = type(samples[0])  # Dynamically use the sample's class
+        sample_cls = type(samples[0])
         sample_dicts = [s.to_dict() for s in samples]
 
+        all_keys: set = set()
+        for d in sample_dicts:
+            all_keys.update(d.keys())
+
         return {
-            key: sample_cls._stack_values(key, [d[key] for d in sample_dicts])
-            for key in sample_dicts[0].keys()
+            key: sample_cls._stack_values(key, [d.get(key) for d in sample_dicts])
+            for key in all_keys
         }
 
 
