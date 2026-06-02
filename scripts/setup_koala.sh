@@ -131,9 +131,10 @@ if [ ! -d "${VENV}" ]; then
 fi
 
 # 安装 flow-factory 包及其核心依赖（transformers, accelerate, deepspeed, wandb 等）
+# --frozen: 不更新 uv.lock（避免触发 geneval/mmcv 的 resolve，那个在 Python 3.12 上构建失败）
 if ! "${VENV}/bin/python" -c "import flow_factory" 2>/dev/null; then
     echo "  uv sync (flow-factory + deepspeed + wandb)..."
-    uv sync --extra deepspeed --extra wandb 2>&1 | tail -3
+    uv sync --extra deepspeed --extra wandb --frozen 2>&1 | tail -3
 else
     echo "  flow-factory already installed"
 fi
