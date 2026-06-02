@@ -381,8 +381,11 @@ def _load_per_source_train_dataloaders(
 
         # Cache fingerprint includes the source name so two sources sharing
         # a dataset_dir with different overrides get separate caches.
+        # For single-source configs, skip the source tag to maintain cache
+        # compatibility with the pre-refactor (legacy dataset_dir) path.
         extra = list(base_kwargs.get("extra_hash_strs", []))
-        extra.append(f"train_source:{d.name}")
+        if len(training_datasets) > 1:
+            extra.append(f"train_source:{d.name}")
         per_kwargs["extra_hash_strs"] = extra
 
         # Per-source max_dataset_size override (DataArguments default
