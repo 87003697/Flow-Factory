@@ -28,14 +28,16 @@ logger = setup_logger(__name__)
 
 # Trainer Registry Storage
 _TRAINER_REGISTRY: Dict[str, str] = {
-    "grpo": "flow_factory.trainers.grpo.GRPOTrainer",
-    "grpo-guard": "flow_factory.trainers.grpo.GRPOGuardTrainer",
-    "trellis2_grpo": "flow_factory.trainers.trellis2_grpo.Trellis2GRPOTrainer",
-    "trellis2_nft": "flow_factory.trainers.trellis2_nft.Trellis2NFTTrainer",
-    "nft": "flow_factory.trainers.nft.DiffusionNFTTrainer",
-    "awm": "flow_factory.trainers.awm.AWMTrainer",
-    "dgpo": "flow_factory.trainers.dgpo.DGPOTrainer",
-    "dpo": "flow_factory.trainers.dpo.DPOTrainer",
+    'grpo': 'flow_factory.trainers.grpo.GRPOTrainer',
+    'grpo-guard': 'flow_factory.trainers.grpo.GRPOGuardTrainer',
+    'trellis2_grpo': 'flow_factory.trainers.trellis2_grpo.Trellis2GRPOTrainer',
+    'trellis2_nft': 'flow_factory.trainers.trellis2_nft.Trellis2NFTTrainer',
+    'nft': 'flow_factory.trainers.nft.DiffusionNFTTrainer',
+    'awm': 'flow_factory.trainers.awm.AWMTrainer',
+    'dgpo': 'flow_factory.trainers.dgpo.DGPOTrainer',
+    'dpo': 'flow_factory.trainers.dpo.DPOTrainer',
+    'crd': 'flow_factory.trainers.crd.CRDTrainer',
+    'diffusion-opd': 'flow_factory.trainers.opd.trainer.DiffusionOPDTrainer',
 }
 
 
