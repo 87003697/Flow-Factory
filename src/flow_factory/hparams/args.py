@@ -809,12 +809,10 @@ class Arguments(ArgABC):
                 "divisor of W*B, or switch to sampler_type='distributed_k_repeat'."
             )
 
-        step = self._base_unique_sample_step()
-        new_unique_sample_num = self._round_up_to_step(ta.unique_sample_num_per_epoch, step)
-        if new_unique_sample_num != ta.unique_sample_num_per_epoch:
-            self._warn_and_assign_unique_sample_num(
-                new_unique_sample_num, "DistributedGroupAlignedSampler",
-            )
+        self._align_unique_sample_num(
+            sampler_name="DistributedGroupAlignedSampler",
+            base_step_func=self._base_unique_sample_step,
+        )
 
     # ---------------------------------------------------------------------
     # Shared alignment primitive (legacy + multi-source dispatch)
