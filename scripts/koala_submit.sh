@@ -1,4 +1,9 @@
 #!/bin/bash
+# Sentinel: 如果存在 /tmp/koala_submit_disabled，立即退出（用于挡住后台 retry loop）
+if [ -f /tmp/koala_submit_disabled ]; then
+    echo "❌ koala_submit disabled by sentinel /tmp/koala_submit_disabled. Remove that file to re-enable."
+    exit 1
+fi
 # ============================================================================
 # Flow-Factory (trellis2) — Mac 端一键提交到 Koala
 # ============================================================================

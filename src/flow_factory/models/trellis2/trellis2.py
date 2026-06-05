@@ -893,9 +893,16 @@ class Trellis2Adapter(BaseAdapter):
     def preprocessing_modules(self) -> List[str]:
         """
         Modules needed during offline preprocessing (Stage 1).
-        Image encoder and sparse structure model for initial structure.
+
+        Image encoder, background removal (used by ``preprocess_image`` when
+        the input lacks alpha), and sparse structure model for initial structure.
         """
-        return ["image_encoder", "sparse_structure_flow_model", "sparse_structure_decoder"]
+        return [
+            "image_encoder",
+            "rembg_model",
+            "sparse_structure_flow_model",
+            "sparse_structure_decoder",
+        ]
 
     @property
     def inference_modules(self) -> List[str]:
