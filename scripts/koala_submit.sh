@@ -51,10 +51,12 @@ fi
 
 # --- 增量同步代码到 S3 ---
 # aws s3 sync: 只上传有变化的文件（按 size + mtime 判断）
+# --delete: 删除远端多余文件（防止旧文件残留，如 training_args.py→package 重构）
 # --exclude: 排除不需要上传的大文件和临时文件
 # --quiet: 不逐文件打印（减少输出噪音）
 echo "Syncing code to S3: ${S3}/"
 aws s3 sync . "${S3}/" \
+    --delete \
     --exclude '.git/*' \
     --exclude '.venv/*' \
     --exclude '*/__pycache__/*' \
