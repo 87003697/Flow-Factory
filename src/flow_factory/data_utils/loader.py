@@ -476,6 +476,13 @@ def get_eval_dataloaders(
     data_args = config.data_args
     eval_args = config.eval_args
 
+    # Resolve dataset class (same logic as get_train_dataloader)
+    if data_args.dataset_type == 'image_3d':
+        from .image_3D_dataset import Image3DDataset
+        dataset_cls = Image3DDataset
+    else:
+        dataset_cls = GeneralDataset
+
     enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
     preprocess_parallelism = getattr(data_args, 'preprocess_parallelism', 'local')
 
@@ -537,6 +544,7 @@ def get_eval_dataloaders(
             base_kwargs=base_kwargs,
             enable_distributed=enable_distributed,
             preprocess_parallelism=preprocess_parallelism,
+            dataset_cls=dataset_cls,
         )
 
         # Create DataLoader
