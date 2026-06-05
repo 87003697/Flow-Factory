@@ -194,7 +194,7 @@ class BaseTrainer(ABC):
                         accelerator=self.accelerator,
                         reward_models=ds_models,
                         reward_configs=ds_configs,
-                        tokenizer=self.adapter.tokenizer,
+                        tokenizer=tokenizer,
                         group_on_same_rank=group_on_same_rank,
                         verbose=self.log_args.verbose,
                     )
