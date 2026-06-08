@@ -119,6 +119,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Trellis2 sparse transformer 的注意力后端选择
 export ATTN_BACKEND=flash_attn
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
+if [ -z "${WANDB_API_KEY}" ]; then
+    export WANDB_MODE=disabled
+fi
 # TRELLIS.2 源码加入 Python 搜索路径
 # trellis2.py 中有 sys.path.insert(0, "third_party/TRELLIS.2") 做同样的事，
 # 但 PYTHONPATH 确保在任何 working directory 下都能 import trellis2
