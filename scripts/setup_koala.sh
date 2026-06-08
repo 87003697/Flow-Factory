@@ -26,7 +26,7 @@
 #   WANDB_API_KEY  WandB 认证（可选，不设则训练不上报 wandb）。
 #
 # S3 资产布局（全部复用 flow_grpo_custom 项目已打好的 tar，无需重新打包）：
-#   /threed-code/ericzyma/data/flow_grpo/
+#   s3://arcwm-code-us-west-2/ericzyma/data/flow_grpo/
 #     TRELLIS.2-4B.tar           (16 GB)  Trellis2 Shape+Tex Flow Model 权重
 #     TRELLIS-image-large.tar    (3.1 GB) 原版 TRELLIS v1 共享组件（ss_dec decoder 等）
 #     dinov3-vitl16.tar          (1.2 GB) DINOv3 图像编码器（Trellis2 条件输入）
@@ -34,6 +34,9 @@
 #     alphaimages_v3.tar         (474 MB) 训练数据集（2396 张 RGBA 图片）
 #     trellis2_reference.tar     (361 MB) TRELLIS.2 源码（含 trellis2 Python 包 + o-voxel）
 #     cuda_site_packages.tar     (145 MB) 预编译 CUDA 扩展（nvdiffrast/CuMesh/FlexGEMM 的 .so）
+#
+# v1.4.0 适配：不再依赖 /threed-code FUSE 挂载。所有 tar 通过 s5cmd cat s3://... 直接
+# 从 S3 API 拉取并管道解压到本地盘，更快更稳（无 FUSE 小文件性能问题）。
 #
 # 恢复后的目录结构：
 #   /data/work/flow-factory/              ← 项目代码（koala --code 拉取）
@@ -72,16 +75,14 @@ done
 # --- 路径配置 ---
 # KOALA_USER: koala CLI 自动注入的用户名（对应 S3 bucket 内的目录名）
 USER="${KOALA_USER:-ericzyma}"
-# S3 FUSE 挂载点（/threed-code/ 是只读 FUSE，读取 tar 用）
-S3_PREFIX="/threed-code/${USER}"
-# S3 API 路径（写入用，绕过 FUSE 限制）
+# v1.4.0: 不再依赖 /threed-code FUSE。所有 S3 资源通过 s5cmd 走 API 拉取。
 S3_BUCKET="s3://arcwm-code-us-west-2/${USER}"
-# 项目代码根目录（koala submit --code 的目标路径）
-PROJECT_DIR="/data/work/flow-factory"
+# S3 API 路径（写入用）
+S3_DATA="${S3_BUCKET}/data/flow_grpo"
+# 项目代码根目录（koala launch 时 cd 到的目录，自动检测）
+PROJECT_DIR="$(pwd)"
 
-# S3 tar 路径
-# 这些 tar 由 flow_grpo_custom 项目的 setup --download 创建，这里直接复用
-S3_DATA="${S3_PREFIX}/data/flow_grpo"
+# S3 tar URI（直接用 s5cmd cat 拉取，不走 FUSE）
 TRELLIS2_TAR="${S3_DATA}/TRELLIS.2-4B.tar"       # Trellis2 4B 模型权重
 DINOV3_TAR="${S3_DATA}/dinov3-vitl16.tar"         # DINOv3 图像编码器
 QWEN_TAR="${S3_DATA}/qwen-image-edit-2511.tar"    # Qwen Guidance（UnifiedReward 用）
@@ -95,14 +96,18 @@ WEIGHTS_LOCAL="/local-ssd/pretrained_weights"
 DATASET_LOCAL="/local-ssd/alphaimages_v2_formatted"
 VENV="/tmp/uv-venv"
 
-cd "${PROJECT_DIR}"
+# koala launch already cd's here; verify the directory is correct
+if [ ! -f "pyproject.toml" ]; then
+    echo "ERROR: PROJECT_DIR=${PROJECT_DIR} does not contain pyproject.toml"
+    return 1 2>/dev/null || exit 1
+fi
 
 # --- 环境变量 ---
 # 把 venv 的 bin 加到 PATH 最前面，确保 python/ninja/ff-train 等命令可用
 export PATH="${VENV}/bin:${PATH}"
 # 告诉 uv 把包装到这个 venv（而非项目内 .venv）
 export UV_PROJECT_ENVIRONMENT="${VENV}"
-# HuggingFace 下载缓存指向本地高速盘（默认 /threed-code/public_models 是只读的）
+# HuggingFace 下载缓存指向本地高速盘（v1.4.0 起 /threed-code 默认不挂载）
 export HF_HOME="/local-ssd/hf_cache"
 # 禁用 HF 的 xet 下载器（在 S3 FUSE 路径写入时会 panic）
 export HF_HUB_DISABLE_XET=1
@@ -219,9 +224,9 @@ fi
 echo "=== [4/7] CUDA extensions ==="
 if "${VENV}/bin/python" -c "import nvdiffrast, cumesh, flex_gemm" 2>/dev/null; then
     echo "  Already installed"
-elif [ -f "${CUDA_SP_TAR}" ]; then
+elif s5cmd ls "${CUDA_SP_TAR}" &>/dev/null; then
     echo "  Restoring pre-built packages from S3 tar..."
-    cat "${CUDA_SP_TAR}" | tar xf - -C "${VENV}/lib/python3.12/site-packages/"
+    s5cmd cat "${CUDA_SP_TAR}" | tar xf - -C "${VENV}/lib/python3.12/site-packages/"
     echo "  Restored (~3s)"
 elif [ "$DOWNLOAD_MODE" = true ]; then
     echo "  ERROR: --download mode for CUDA ext not implemented yet."
@@ -244,10 +249,10 @@ fi
 echo "=== [5/7] TRELLIS.2 reference code ==="
 if [ -d "${PROJECT_DIR}/third_party/TRELLIS.2/trellis2" ]; then
     echo "  Already present"
-elif [ -f "${REFERENCE_TAR}" ]; then
+elif s5cmd ls "${REFERENCE_TAR}" &>/dev/null; then
     echo "  Restoring from S3 tar..."
     mkdir -p "${PROJECT_DIR}/third_party"
-    cat "${REFERENCE_TAR}" | tar xf - -C "${PROJECT_DIR}/third_party/"
+    s5cmd cat "${REFERENCE_TAR}" | tar xf - -C "${PROJECT_DIR}/third_party/"
     echo "  Restored"
 elif [ "$DOWNLOAD_MODE" = true ]; then
     echo "  Cloning TRELLIS.2..."
@@ -286,9 +291,9 @@ mkdir -p "${WEIGHTS_LOCAL}"
 # TRELLIS.2-4B: Shape 和 Tex 两个 Flow Model 的权重（~16 GB）
 if [ -d "${WEIGHTS_LOCAL}/TRELLIS.2-4B" ]; then
     echo "  TRELLIS.2-4B: present"
-elif [ -f "${TRELLIS2_TAR}" ]; then
+elif s5cmd ls "${TRELLIS2_TAR}" &>/dev/null; then
     echo "  TRELLIS.2-4B: restoring (~30s)..."
-    cat "${TRELLIS2_TAR}" | tar xf - -C "${WEIGHTS_LOCAL}/"
+    s5cmd cat "${TRELLIS2_TAR}" | tar xf - -C "${WEIGHTS_LOCAL}/"
     echo "  TRELLIS.2-4B: done"
 else
     echo "  WARNING: No TRELLIS.2-4B tar. Model loading will fail."
@@ -297,9 +302,9 @@ fi
 # DINOv3: 图像条件编码器（Trellis2 用 DINOv3 提取图像特征作为条件输入）
 if [ -d "${WEIGHTS_LOCAL}/dinov3-vitl16-pretrain-lvd1689m" ]; then
     echo "  DINOv3: present"
-elif [ -f "${DINOV3_TAR}" ]; then
+elif s5cmd ls "${DINOV3_TAR}" &>/dev/null; then
     echo "  DINOv3: restoring..."
-    cat "${DINOV3_TAR}" | tar xf - -C "${WEIGHTS_LOCAL}/"
+    s5cmd cat "${DINOV3_TAR}" | tar xf - -C "${WEIGHTS_LOCAL}/"
     echo "  DINOv3: done"
 fi
 
@@ -309,9 +314,9 @@ fi
 # 不预下载的话，7 个 rank 会同时从 HF 下载，拖慢启动且可能 rate-limit。
 if [ -d "${WEIGHTS_LOCAL}/TRELLIS-image-large" ]; then
     echo "  TRELLIS-image-large: present"
-elif [ -f "${TRELLIS1_TAR}" ]; then
+elif s5cmd ls "${TRELLIS1_TAR}" &>/dev/null; then
     echo "  TRELLIS-image-large: restoring..."
-    cat "${TRELLIS1_TAR}" | tar xf - -C "${WEIGHTS_LOCAL}/"
+    s5cmd cat "${TRELLIS1_TAR}" | tar xf - -C "${WEIGHTS_LOCAL}/"
     echo "  TRELLIS-image-large: done"
 fi
 
@@ -329,9 +334,9 @@ ln -sfn "${WEIGHTS_LOCAL}" "${PROJECT_DIR}/pretrained_weights"
 # tar 内部结构: alphaimages_v2_formatted/{train.jsonl, test.jsonl, images/}
 if [ -d "${DATASET_LOCAL}/images" ]; then
     echo "  Dataset: present"
-elif [ -f "${DATASET_TAR}" ]; then
+elif s5cmd ls "${DATASET_TAR}" &>/dev/null; then
     echo "  Dataset: restoring..."
-    cat "${DATASET_TAR}" | tar xf - -C /local-ssd/
+    s5cmd cat "${DATASET_TAR}" | tar xf - -C /local-ssd/
     echo "  Dataset: done"
 fi
 mkdir -p "${PROJECT_DIR}/dataset"
