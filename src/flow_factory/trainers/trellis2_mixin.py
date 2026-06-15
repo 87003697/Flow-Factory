@@ -145,6 +145,51 @@ class Trellis2TrainerMixin:
         else:
             self._flowedit_cfg = None
 
+        self._patch_rope_phases_clone()
+
+    def _patch_rope_phases_clone(self) -> None:
+        """Monkey-patch the training-stage transformer to clone rope_phases per forward.
+
+        The dense transformer's ``rope_phases`` buffer (complex64, [4096, 64])
+        is shared across all 30 transformer blocks.  Autograd saves views of it
+        (``phases.unsqueeze(-2)``) for backward, and with gradient checkpointing
+        (``use_reentrant=False``), version-counter conflicts arise between
+        checkpoint boundaries.  Cloning once per forward gives autograd a fresh
+        tensor with its own version counter.
+        """
+        model = self.adapter.pipeline.transformer
+        if not hasattr(model, "rope_phases") or model.rope_phases is None:
+            return
+
+        _orig_forward = model.forward
+
+        def _forward_with_cloned_phases(x, t, cond):
+            orig_buf = model.rope_phases
+            model.rope_phases = orig_buf.clone()
+            try:
+                return _orig_forward(x, t, cond)
+            finally:
+                model.rope_phases = orig_buf
+
+        model.forward = _forward_with_cloned_phases
+        logger.info(
+            "Patched %s.forward to clone rope_phases (%s) per call",
+            type(model).__name__,
+            list(model.rope_phases.shape),
+        )
+
+    def _set_transformer_checkpoint(self, enabled: bool) -> None:
+        """Toggle gradient checkpointing on the training-stage transformer."""
+        model = self.adapter.pipeline.transformer
+        if not hasattr(model, "blocks"):
+            return
+        count = 0
+        for block in model.blocks:
+            if hasattr(block, "use_checkpoint"):
+                block.use_checkpoint = enabled
+                count += 1
+        logger.info("Set use_checkpoint=%s on %d blocks", enabled, count)
+
     # Rollout helpers
 
     def _rollout_group(

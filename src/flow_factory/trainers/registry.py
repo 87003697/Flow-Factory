@@ -32,6 +32,7 @@ _TRAINER_REGISTRY: Dict[str, str] = {
     'grpo-guard': 'flow_factory.trainers.grpo.GRPOGuardTrainer',
     'trellis2_grpo': 'flow_factory.trainers.trellis2_grpo.Trellis2GRPOTrainer',
     'trellis2_nft': 'flow_factory.trainers.trellis2_nft.Trellis2NFTTrainer',
+    'trellis2_opd': 'flow_factory.trainers.trellis2_opd.Trellis2OPDTrainer',
     'nft': 'flow_factory.trainers.nft.DiffusionNFTTrainer',
     'awm': 'flow_factory.trainers.awm.AWMTrainer',
     'dgpo': 'flow_factory.trainers.dgpo.DGPOTrainer',

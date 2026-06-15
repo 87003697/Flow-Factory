@@ -29,6 +29,7 @@ from .dpo import DPOTrainingArguments
 from .dgpo import DGPOTrainingArguments
 from .crd import CRDTrainingArguments
 from .opd import DiffusionOPDTrainingArguments, TeacherConfig
+from .trellis2_opd import Trellis2OPDTrainingArguments
 
 __all__ = [
     "EvaluationArguments",
@@ -40,6 +41,7 @@ __all__ = [
     "DGPOTrainingArguments",
     "CRDTrainingArguments",
     "DiffusionOPDTrainingArguments",
+    "Trellis2OPDTrainingArguments",
     "TeacherConfig",
     "get_training_args_class",
     "list_registered_training_args",

@@ -79,8 +79,8 @@ USER="${KOALA_USER:-ericzyma}"
 S3_BUCKET="s3://arcwm-code-us-west-2/${USER}"
 # S3 API 路径（写入用）
 S3_DATA="${S3_BUCKET}/data/flow_grpo"
-# 项目代码根目录（koala launch 时 cd 到的目录，自动检测）
-PROJECT_DIR="$(pwd)"
+# 项目代码根目录（koala --code 拉取目标）
+PROJECT_DIR="/data/work/run_codes"
 
 # S3 tar URI（直接用 s5cmd cat 拉取，不走 FUSE）
 TRELLIS2_TAR="${S3_DATA}/TRELLIS.2-4B.tar"       # Trellis2 4B 模型权重
@@ -96,13 +96,11 @@ WEIGHTS_LOCAL="/local-ssd/pretrained_weights"
 DATASET_LOCAL="/local-ssd/alphaimages_v2_formatted"
 VENV="/tmp/uv-venv"
 
-# koala launch already cd's here; verify the directory is correct
-if [ ! -f "pyproject.toml" ]; then
-    echo "ERROR: PROJECT_DIR=${PROJECT_DIR} does not contain pyproject.toml"
-    return 1 2>/dev/null || exit 1
-fi
+cd "${PROJECT_DIR}"
 
 # --- 环境变量 ---
+# Prevent `uv run` from re-resolving all extras (geneval → mmcv build fails on Python 3.12)
+export UV_FROZEN=1
 # 把 venv 的 bin 加到 PATH 最前面，确保 python/ninja/ff-train 等命令可用
 export PATH="${VENV}/bin:${PATH}"
 # 告诉 uv 把包装到这个 venv（而非项目内 .venv）
@@ -118,10 +116,7 @@ export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Trellis2 sparse transformer 的注意力后端选择
 export ATTN_BACKEND=flash_attn
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
-if [ -z "${WANDB_API_KEY}" ]; then
-    export WANDB_MODE=disabled
-fi
+export WANDB_API_KEY="${WANDB_API_KEY}"
 # TRELLIS.2 源码加入 Python 搜索路径
 # trellis2.py 中有 sys.path.insert(0, "third_party/TRELLIS.2") 做同样的事，
 # 但 PYTHONPATH 确保在任何 working directory 下都能 import trellis2
@@ -175,6 +170,10 @@ if [[ "${TORCH_VER}" != 2.6.0* ]]; then
 else
     echo "  Already 2.6.0+cu124"
 fi
+
+# Ensure torch's bundled NCCL is found before system NCCL (container's EFA plugin
+# ships an older NCCL missing ncclCommResume → undefined symbol at import torch)
+export LD_LIBRARY_PATH="${VENV}/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH:-}"
 
 # ============================================================================
 # [3/7] Trellis2 额外依赖（不在 pyproject.toml 中）
@@ -395,3 +394,8 @@ echo "Quick start:"
 echo "  ff-train examples/grpo/lora/trellis2/shape.yaml"
 echo ""
 echo "========================================="
+
+# Koala PyTorchJob injects RANK/WORLD_SIZE/LOCAL_RANK as env vars without actually
+# using torchrun. ff-train's CLI sees RANK and skips accelerate launch. Unset them
+# so ff-train uses accelerate with the yaml's num_processes.
+unset RANK WORLD_SIZE LOCAL_RANK MASTER_ADDR MASTER_PORT GROUP_RANK LOCAL_WORLD_SIZE 2>/dev/null || true

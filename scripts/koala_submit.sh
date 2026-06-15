@@ -73,13 +73,11 @@ echo "Code synced."
 echo ""
 
 # --- 提交到 Koala ---
-# --code "$S3:/data/work/flow-factory": 告诉 Pod 从 S3 拉代码到容器内指定路径
+# --code "$S3:/data/work/run_codes": 告诉 Pod 从 S3 拉代码到容器内指定路径
 # "$@": 透传所有额外参数给 koala submit（如 -m normal, -g 8, -c "..." 等）
 # LC_ALL / PYTHONIOENCODING: 防止含中文文件名时 koala CLI 报编码错误
 #
 # 注意：Koala 只自动注入 AWS 凭证，HF_TOKEN 和 WANDB_API_KEY 需要手动传递。
-# 通过在 -c 命令前 export 这些变量（双引号让本地 shell 展开值）。
-# 如果用户自己提供了 -c 参数，我们在其前面注入 env vars。
 echo "Submitting to Koala..."
 
 # 构建环境变量注入前缀（仅注入本地有值的变量）
@@ -100,4 +98,4 @@ for i in "${!ARGS[@]}"; do
 done
 
 LC_ALL=en_US.UTF-8 PYTHONIOENCODING=utf-8 \
-    koala submit --code "${S3}:/data/work/flow-factory" "${ARGS[@]}"
+    koala submit --code "${S3}:/data/work/run_codes" "${ARGS[@]}"

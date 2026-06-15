@@ -388,12 +388,14 @@ class Trellis2Sample(I2VSample):
             return torch.cat(chunks, dim=0)
 
         # sparse trajectory: (T, N_b, C) per sample → (N_total, T, C)
+        # Dense stage latents are (T, C, D, H, W) — same shape, so torch.stack.
         if key in cls._SPARSE_LATENT_FIELDS:
             non_null = [v for v in values if v is not None]
             if not non_null:
                 return None
-            # (T, N_b, C) → (N_b, T, C), then cat along dim 0
-            return torch.cat([v.permute(1, 0, 2) for v in non_null], dim=0)
+            if non_null[0].dim() == 3:
+                return torch.cat([v.permute(1, 0, 2) for v in non_null], dim=0)
+            return torch.stack(non_null)
 
         # sparse conditioning: (N_b, C) per sample → (N_total, C)
         if key in cls._SPARSE_CONDITION_FIELDS:
@@ -915,15 +917,21 @@ class Trellis2Adapter(BaseAdapter):
         """
         target = self.pipeline._target_flow_model  # e.g. 'shape_slat_1024'
         stage = target.split("_")[0]  # 'shape', 'tex', or 'dense'
-        res_suffix = target.split("_")[-1]  # '1024' or '512'
 
         decoders = ["shape_decoder", "tex_decoder"]
         upstream = ["sparse_structure_flow_model", "sparse_structure_decoder"]
 
-        if stage != "shape":
-            upstream.append(f"transformer_shape_{res_suffix}")
-        if stage != "tex":
-            upstream.append(f"transformer_tex_{res_suffix}")
+        if stage == "dense":
+            upstream.extend([
+                "transformer_shape_1024", "transformer_shape_512",
+                "transformer_tex_1024", "transformer_tex_512",
+            ])
+        else:
+            res_suffix = target.split("_")[-1]  # '1024' or '512'
+            if stage != "shape":
+                upstream.append(f"transformer_shape_{res_suffix}")
+            if stage != "tex":
+                upstream.append(f"transformer_tex_{res_suffix}")
 
         return ["transformer", "image_encoder"] + upstream + decoders
 
@@ -1564,6 +1572,8 @@ class Trellis2Adapter(BaseAdapter):
         envmap_path: Optional[str] = None,
         # Pre-created samples (skip stub creation; enables stage-skip)
         samples: Optional[List["Trellis2Sample"]] = None,
+        # Training: visibility mask computation
+        compute_visibility_masks: bool = False,
         **kwargs,
     ) -> List[Trellis2Sample]:
         """Multi-stage inference dispatcher for Trellis2.
@@ -1708,6 +1718,7 @@ class Trellis2Adapter(BaseAdapter):
                     bg_color=render_bg_color,
                     render_mode=render_mode,
                     envmap=envmap,
+                    compute_visibility_masks=compute_visibility_masks,
                 )
 
         return samples
@@ -2033,6 +2044,18 @@ class Trellis2Adapter(BaseAdapter):
         for b in range(B):
             coords_b = all_coords[all_coords[:, 0] == b].clone().contiguous()  # (N_b, 4)
             N_b = coords_b.shape[0]
+            if N_b == 0:
+                center = ss_resolution // 2
+                coords_b = torch.tensor(
+                    [[b, center, center, center]],
+                    dtype=torch.int32,
+                    device=z_s.device,
+                )
+                logger.warning(
+                    "Sample %d has 0 active voxels after dense decode; "
+                    "injecting single center coord to preserve batch dimension.",
+                    b,
+                )
             if max_num_coords > 0 and N_b > max_num_coords:
                 perm = torch.randperm(N_b, device=coords_b.device)[
                     :max_num_coords
@@ -2591,6 +2614,7 @@ class Trellis2Adapter(BaseAdapter):
         self,
         sample: Trellis2Sample,
         return_subs: bool = False,
+        return_h: bool = False,
     ) -> Any:
         """
         Decode shape structured latent to mesh.
@@ -2602,9 +2626,13 @@ class Trellis2Adapter(BaseAdapter):
         Args:
             sample: Trellis2Sample with shape stage data
             return_subs: Whether to return subdivisions (needed for texture decoding)
+            return_h: Whether to return the intermediate SparseTensor h
+                (for visibility mask computation during training)
 
         Returns:
-            Mesh object, or (mesh, subs) if return_subs=True
+            Mesh object, or (mesh, subs) if return_subs=True,
+            or (mesh, subs, h) if both return_subs and return_h are True,
+            or (mesh, h) if only return_h=True
         """
         device = self.device
 
@@ -2635,8 +2663,12 @@ class Trellis2Adapter(BaseAdapter):
             logger.warning(
                 "decode_shape: degenerate latent (0-point output), returning None",
             )
+            if return_subs and return_h:
+                return None, subs, None
             if return_subs:
                 return None, subs
+            if return_h:
+                return None, None
             return None
 
         # FlexiDualGridVaeDecoder post-processing: raw SparseTensor to Mesh
@@ -2662,8 +2694,12 @@ class Trellis2Adapter(BaseAdapter):
         ]
         mesh = meshes[0] if meshes else None
 
+        if return_subs and return_h:
+            return mesh, subs, h
         if return_subs:
             return mesh, subs
+        if return_h:
+            return mesh, h
         return mesh
 
     @torch.no_grad()
@@ -2804,6 +2840,7 @@ class Trellis2Adapter(BaseAdapter):
         envmap: Optional[Any] = None,
         envmap_path: Optional[str] = None,
         render_mode: Literal["shaded", "clay", "normal"] = "shaded",
+        compute_visibility_masks: bool = False,
         **render_kwargs,
     ) -> Trellis2Sample:
         """Decode latents to mesh and render deterministic multiview frames.
@@ -2837,17 +2874,62 @@ class Trellis2Adapter(BaseAdapter):
         Returns:
             The same *sample* with ``sample.video`` set to a
             ``(T, C, H, W)`` float32 tensor in [0, 1].
+            When *compute_visibility_masks* is True, also stores
+            ``sample.extra_kwargs["visibility_masks"]`` as a
+            ``(num_frames, D, D, D)`` CPU tensor.
         """
         try:
-            mesh = self.decode_latents(sample)
+            h = None
+            if compute_visibility_masks:
+                mesh, subs, h = self.decode_shape(sample, return_subs=True, return_h=True)
+            else:
+                mesh, subs = self.decode_shape(sample, return_subs=True)
+
             if mesh is None:
+                if subs:
+                    for sub in subs:
+                        sub.clear_spatial_cache()
+                    del subs
                 logger.warning("render_latents: degenerate latent, filling dummy outputs")
                 _fill_dummy_render_outputs(sample, num_frames, resolution)
                 return sample
+
+            tex_voxels = self.decode_texture(sample, subs)
+            for sub in subs:
+                sub.clear_spatial_cache()
+            del subs
+            torch.cuda.empty_cache()
+
+            if tex_voxels is not None:
+                res = sample.resolution or 1024
+                textured_mesh = MeshWithVoxel(
+                    mesh.vertices,
+                    mesh.faces,
+                    origin=[-0.5, -0.5, -0.5],
+                    voxel_size=1 / res,
+                    coords=tex_voxels.coords[:, 1:],
+                    attrs=tex_voxels.feats,
+                    voxel_shape=torch.Size([*tex_voxels.shape, *tex_voxels.spatial_shape]),
+                    layout=self.pipeline.pbr_attr_layout
+                    if hasattr(self.pipeline, "pbr_attr_layout")
+                    else None,
+                )
+            else:
+                textured_mesh = mesh
+
+            if compute_visibility_masks and h is not None:
+                masks = self._compute_visibility_from_h(
+                    h, sample, num_frames,
+                    mode=render_kwargs.get("visibility_mask_mode", "any"),
+                    target_res=render_kwargs.get("visibility_mask_target_res", 16),
+                )
+                sample.extra_kwargs["visibility_masks"] = masks
+                del h
+
             torch.cuda.empty_cache()
             return self.render_mesh(
                 sample,
-                mesh,
+                textured_mesh,
                 num_frames,
                 resolution,
                 bg_color,
@@ -2862,6 +2944,92 @@ class Trellis2Adapter(BaseAdapter):
             logger.warning("render_latents: CUDA OOM, filling dummy outputs")
             _fill_dummy_render_outputs(sample, num_frames, resolution)
             return sample
+
+    @torch.no_grad()
+    def _compute_visibility_from_h(
+        self,
+        h,
+        sample: Trellis2Sample,
+        num_frames: int,
+        mode: str = "any",
+        target_res: int = 16,
+    ) -> torch.Tensor:
+        """Compute per-frame visibility masks from decoded geometry.
+
+        Uses o_voxel ray-cube intersection on decoded voxel coords, then maps
+        visible voxels back to a target grid (target_res³).
+
+        Args:
+            mode: "any" (binary OR), "all" (binary AND), "soft" (visible fraction).
+            target_res: Output grid resolution. Dense OPD uses 16; sparse would use ss_resolution.
+
+        Returns:
+            (num_frames, target_res, target_res, target_res) float32 CPU tensor.
+        """
+        from .trellis2_cameras import get_render_cameras
+        from flow_factory.trainers.trellis2_opd import compute_voxel_visibility
+
+        ss_resolution = 32 if (sample.resolution or 1024) <= 512 else 64
+        effective_res = ss_resolution * 16
+
+        h_coords = h.coords  # (M, 4): [batch_idx, x, y, z]
+        batch_mask = h_coords[:, 0] == 0
+        voxel_coords = h_coords[batch_mask, 1:4]
+        coords_3d = (voxel_coords.float() + 0.5) / effective_res - 0.5
+        voxel_size = 1.0 / effective_res
+        device = coords_3d.device
+
+        all_frame_masks = torch.zeros(
+            num_frames, target_res, target_res, target_res, dtype=torch.float32
+        )
+
+        # Pre-compute total surface voxels per latent cell (needed for soft/all)
+        all_latent_coords = (voxel_coords * target_res // effective_res).long().clamp(
+            0, target_res - 1
+        )
+        if mode != "any":
+            total_per_cell = torch.zeros(
+                target_res, target_res, target_res, device=device
+            )
+            total_per_cell.index_put_(
+                (all_latent_coords[:, 0], all_latent_coords[:, 1], all_latent_coords[:, 2]),
+                torch.ones(all_latent_coords.shape[0], device=device),
+                accumulate=True,
+            )
+
+        extrinsics_list, intrinsics_list = get_render_cameras(num_frames)
+
+        for fi in range(num_frames):
+            extr = extrinsics_list[fi].to(device)
+            intr = intrinsics_list[fi].to(device)
+            visible = compute_voxel_visibility(
+                coords_3d, extr, intr, voxel_size, render_resolution=512
+            )
+            visible_latent = all_latent_coords[visible]
+
+            if visible_latent.numel() == 0:
+                continue
+
+            if mode == "any":
+                all_frame_masks[
+                    fi, visible_latent[:, 0], visible_latent[:, 1], visible_latent[:, 2]
+                ] = 1.0
+            else:
+                vis_count = torch.zeros(
+                    target_res, target_res, target_res, device=device
+                )
+                vis_count.index_put_(
+                    (visible_latent[:, 0], visible_latent[:, 1], visible_latent[:, 2]),
+                    torch.ones(visible_latent.shape[0], device=device),
+                    accumulate=True,
+                )
+                ratio = vis_count / total_per_cell.clamp(min=1.0)
+                if mode == "soft":
+                    all_frame_masks[fi] = ratio.cpu()
+                elif mode == "all":
+                    all_frame_masks[fi] = (ratio >= 1.0).float().cpu()
+
+        return all_frame_masks
 
     def render_mesh(
         self,
@@ -2879,23 +3047,9 @@ class Trellis2Adapter(BaseAdapter):
         if envmap is None:
             envmap = self._build_envmap(envmap_path)
 
-        _FOV_DEG = 40.0
-        _PITCH_DEG = 20.0
-        _FILL_RATIO = 0.9
-        _START_YAW = np.pi  # front-facing view first (180° from default)
-        r = _compute_adaptive_distance(_FOV_DEG, fill_ratio=_FILL_RATIO)
-        yaws_rad = torch.linspace(
-            _START_YAW,
-            _START_YAW + 2 * np.pi,
-            num_frames + 1,
-        )[:-1].tolist()
-        pitchs_rad = [np.deg2rad(_PITCH_DEG)] * num_frames
-        extrinsics, intrinsics = render_utils.yaw_pitch_r_fov_to_extrinsics_intrinsics(
-            yaws_rad,
-            pitchs_rad,
-            r,
-            _FOV_DEG,
-        )
+        from .trellis2_cameras import get_render_cameras
+
+        extrinsics, intrinsics = get_render_cameras(num_frames)
         # nvdiffrast 在 faces > ~16M (2^24) 时会触发 subtriangle count overflow，
         # 改用 chunked 渲染器按 4M faces 分块跑 + 跨 chunk 深度合成（无上限），
         # 不再依赖 mesh.simplify 做面数限流。
