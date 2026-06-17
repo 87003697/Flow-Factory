@@ -665,16 +665,26 @@ class LogTable:
     @classmethod
     def from_i2v_samples(cls, samples: List[I2VSample]) -> Optional["LogTable"]:
         """
-        Build table from I2V samples: [condition_images...] -> video.
+        Build table from I2V samples: [condition_images...] -> video [-> _log_panels...].
 
         Sets `target_height` from the **first valid generation's height** for unified display.
+        Extra video panels from ``sample.extra_kwargs["_log_panels"]`` are appended as
+        additional columns (generic hook for visibility heatmaps, depth, etc.).
         """
         if not samples or not hasattr(samples[0], "condition_images"):
             return None
 
         first_conds = _to_pil_list(samples[0].condition_images)
         n_conds = len(first_conds)
-        columns = [f"condition_image_{i}" for i in range(n_conds)] + ["generation"]
+        n_panels = max(
+            (len(s.extra_kwargs.get("_log_panels", [])) for s in samples if s.video is not None),
+            default=0,
+        )
+        columns = (
+            [f"condition_image_{i}" for i in range(n_conds)]
+            + ["generation"]
+            + [f"panel_{i}" for i in range(n_panels)]
+        )
 
         rows = []
         target_height = None
@@ -695,6 +705,12 @@ class LogTable:
             # Build row with None padding for missing conditions
             cond_items: List[Optional[LogImage]] = [LogImage(c) for c in conds]
             row = cond_items + [None] * (n_conds - len(conds)) + [gen_video]
+
+            panels = s.extra_kwargs.get("_log_panels", [])
+            for p in panels:
+                row.append(LogVideo(p))
+            row.extend([None] * (n_panels - len(panels)))
+
             rows.append(row)
 
         return cls(columns=columns, rows=rows, target_height=target_height) if rows else None

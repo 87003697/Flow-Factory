@@ -89,6 +89,25 @@ from .chunked_mixin import ChunkedDecoderMixin
 from .pbr_mesh_renderer_chunked import render_frames_chunked
 
 
+def _build_viridis_lut() -> torch.Tensor:
+    """Build a 256x3 viridis colormap LUT via linear interpolation of 5 control points."""
+    controls = torch.tensor([
+        [0.267004, 0.004874, 0.329415],
+        [0.282327, 0.140926, 0.457517],
+        [0.127568, 0.566949, 0.550556],
+        [0.741388, 0.873449, 0.149561],
+        [0.993248, 0.906157, 0.143936],
+    ], dtype=torch.float32)  # (5, 3)
+    t = torch.linspace(0, 1, 256)
+    idx = (t * (len(controls) - 1)).clamp(0, len(controls) - 1 - 1e-6)
+    lo = idx.long()
+    frac = (idx - lo).unsqueeze(1)
+    return controls[lo] * (1 - frac) + controls[lo + 1] * frac  # (256, 3)
+
+
+_VIRIDIS_LUT = _build_viridis_lut()  # (256, 3) float32 CPU
+
+
 def _composite_rgba_pil(
     img: Image.Image,
     bg_color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
@@ -2924,12 +2943,13 @@ class Trellis2Adapter(BaseAdapter):
                 textured_mesh = mesh
 
             if compute_visibility_masks and h is not None:
-                masks = self._compute_visibility_from_h(
+                masks, vis_heatmap = self._compute_visibility_from_h(
                     h, sample, num_frames,
                     mode=visibility_mask_mode,
                     target_res=visibility_mask_target_res,
                 )
                 sample.extra_kwargs["visibility_masks"] = masks
+                sample.extra_kwargs.setdefault("_log_panels", []).append(vis_heatmap)
                 del h
 
             torch.cuda.empty_cache()
@@ -2959,18 +2979,14 @@ class Trellis2Adapter(BaseAdapter):
         num_frames: int,
         mode: str = "any",
         target_res: int = 16,
-    ) -> torch.Tensor:
-        """Compute per-frame visibility masks from decoded geometry.
-
-        Uses o_voxel ray-cube intersection on decoded voxel coords, then maps
-        visible voxels back to a target grid (target_res³).
-
-        Args:
-            mode: "any" (binary OR), "all" (binary AND), "soft" (visible fraction).
-            target_res: Output grid resolution. Dense OPD uses 16; sparse would use ss_resolution.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-frame visibility masks and viridis heatmaps.
 
         Returns:
-            (num_frames, target_res, target_res, target_res) float32 CPU tensor.
+            (masks, heatmap):
+                masks: (num_frames, target_res, target_res, target_res) float32 CPU.
+                heatmap: (num_frames, 3, H, W) float32 CPU — viridis-colored per-pixel
+                    visibility count, suitable for direct logging as a video panel.
         """
         from .trellis2_cameras import get_render_cameras
         from flow_factory.trainers.trellis2_opd import compute_voxel_visibility
@@ -2984,6 +3000,7 @@ class Trellis2Adapter(BaseAdapter):
         coords_3d = (voxel_coords.float() + 0.5) / effective_res - 0.5
         voxel_size = 1.0 / effective_res
         device = coords_3d.device
+        N = coords_3d.shape[0]
 
         all_frame_masks = torch.zeros(
             num_frames, target_res, target_res, target_res, dtype=torch.float32
@@ -3004,14 +3021,31 @@ class Trellis2Adapter(BaseAdapter):
             )
 
         extrinsics_list, intrinsics_list = get_render_cameras(num_frames)
+        render_res = 512
+        viridis = _VIRIDIS_LUT.to(device)  # (256, 3)
+
+        # Accumulate per-voxel visibility count across all frames for heatmap
+        vis_count_total = torch.zeros(N, device=device)
+        heatmap_frames = []
 
         for fi in range(num_frames):
             extr = extrinsics_list[fi].to(device)
             intr = intrinsics_list[fi].to(device)
-            visible = compute_voxel_visibility(
-                coords_3d, extr, intr, voxel_size, render_resolution=512
+            visible, voxel_id = compute_voxel_visibility(
+                coords_3d, extr, intr, voxel_size, render_resolution=render_res
             )
+            vis_count_total += visible.float()
             visible_latent = all_latent_coords[visible]
+
+            # Per-pixel heatmap: map voxel_id → accumulated visibility count → viridis
+            heatmap_hw = torch.zeros(render_res, render_res, 3, device=device)
+            fg = voxel_id >= 0  # (H, W)
+            ids = voxel_id[fg].long()  # per-pixel voxel index
+            counts = vis_count_total[ids]  # per-pixel accumulated count
+            normed = (counts / max(fi + 1, 1)).clamp(0, 1)
+            lut_idx = (normed * 255).long().clamp(0, 255)
+            heatmap_hw[fg] = viridis[lut_idx]
+            heatmap_frames.append(heatmap_hw.permute(2, 0, 1).cpu())  # (3, H, W)
 
             if visible_latent.numel() == 0:
                 continue
@@ -3035,7 +3069,8 @@ class Trellis2Adapter(BaseAdapter):
                 elif mode == "all":
                     all_frame_masks[fi] = (ratio >= 1.0).float().cpu()
 
-        return all_frame_masks
+        heatmap_video = torch.stack(heatmap_frames)  # (T, 3, H, W) float32 CPU
+        return all_frame_masks, heatmap_video
 
     def render_mesh(
         self,

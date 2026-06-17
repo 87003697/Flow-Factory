@@ -66,7 +66,7 @@ def compute_voxel_visibility(
     intrinsics: torch.Tensor,
     voxel_size: float,
     render_resolution: int = 512,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Voxel visibility via o_voxel cube rasterization (ray-cube intersection).
 
     Args:
@@ -77,7 +77,7 @@ def compute_voxel_visibility(
         render_resolution: Rasterization resolution for ray-cube test.
 
     Returns:
-        Boolean mask (N,) where True = visible from camera.
+        (visible, voxel_id): Boolean mask (N,) and per-pixel hit index (H, W).
     """
 
     device = coords_3d.device
@@ -93,7 +93,35 @@ def compute_voxel_visibility(
 
     visible = torch.zeros(N, dtype=torch.bool, device=device)
     visible[visible_ids.long()] = True
-    return visible
+    return visible, voxel_id
+
+
+class TargetImageBuffer:
+    """Buffer for target images extracted from rollout videos.
+
+    Decouples frame extraction (during sample()) from encoding (during
+    prepare_feedback()), making it easy to swap in FlowEdit-edited frames later.
+    """
+
+    def __init__(self, seed: int):
+        self._seed = seed
+        self._images: List[Optional["Image.Image"]] = []
+
+    def clear(self):
+        self._images.clear()
+
+    def add_samples(self, samples: List[BaseSample], epoch: int):
+        for s in samples:
+            if s.video is None:
+                self._images.append(None)
+                continue
+            gen = create_generator(self._seed, epoch, s.unique_id)
+            idx = torch.randint(0, s.video.shape[0], (1,), generator=gen).item()
+            s.extra_kwargs["c_tgt_frame_idx"] = idx
+            self._images.append(to_pil_image(s.video[idx].clamp(0, 1)))
+
+    def get_images(self) -> List[Optional["Image.Image"]]:
+        return self._images
 
 
 
@@ -120,6 +148,8 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
         # OPD needs rendered views for c_tgt, so rollout must run all stages
         if self._training_stage == "dense":
             self._inference_stages = ["dense", "shape", "tex"]
+
+        self._tgt_buffer = TargetImageBuffer(self.training_args.seed)
 
         scheduler = self.adapter.scheduler
         self._is_sde = scheduler.dynamics_type != "ODE"
@@ -167,6 +197,7 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
         """Generate rollouts with cross-GPU upstream stage sharing."""
         self.adapter.rollout()
         samples: List[BaseSample] = []
+        self._tgt_buffer.clear()
         data_iter = iter(self.dataloader)
 
         train_step_indices = self._select_train_step_indices(
@@ -206,6 +237,7 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                     self.accelerator.wait_for_everyone()
                     continue
                 samples.extend(sample_batch)
+                self._tgt_buffer.add_samples(sample_batch, self.epoch)
                 self.accelerator.wait_for_everyone()
 
         if skipped_windows > 0:
@@ -216,6 +248,17 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
         if not samples:
             logger.warning("All sample windows skipped (OOM), skipping feedback.")
             return
+        self._encode_c_tgt(samples, self._tgt_buffer.get_images())
+        self._tgt_buffer.clear()
+        if self.training_args.use_visibility_mask:
+            _build_vis = (
+                self._build_visibility_masks_sparse
+                if self._training_stage != "dense"
+                else self._build_visibility_masks_dense
+            )
+            _build_vis(samples)
+        if self.accelerator.is_main_process:
+            self.log_data({"train_samples": samples[:2]}, step=self.step)
 
     # =============================== Optimization ===============================
 
@@ -229,10 +272,6 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
             self.training_args.num_inference_steps, self.training_args.timestep_range
         )
 
-        self._compute_c_tgt(samples)
-        if self.training_args.use_visibility_mask:
-            _build_vis = self._build_visibility_masks_sparse if self._training_stage != "dense" else self._build_visibility_masks_dense
-            _build_vis(samples)
         self._precompute_mu_T(samples, train_timesteps)
 
         self._distill(samples, train_timesteps)
@@ -240,27 +279,16 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
     # =============================== c_tgt encoding ===============================
 
     @torch.no_grad()
-    def _compute_c_tgt(self, samples: List[BaseSample]) -> None:
-        """Extract a random frame from each sample's video and encode as c_tgt.
+    def _encode_c_tgt(self, samples: List[BaseSample], images: List[Optional["Image.Image"]]) -> None:
+        """Encode pre-extracted target frames as c_tgt conditioning.
 
-        Must run AFTER sample() — inference overwrites extra_kwargs.
+        Frame extraction is done by TargetImageBuffer during sample(); this
+        method only handles the encoding pass (rembg + DINOv2).
         """
         batch_pil: List[List] = []
-        for sample in samples:
-            if sample.video is None:
-                batch_pil.append([])
-                continue
-            num_frames = sample.video.shape[0]
-            gen = create_generator(self.training_args.seed, self.epoch, sample.unique_id)
-            frame_idx = torch.randint(0, num_frames, (1,), generator=gen).item()
-            sample.extra_kwargs["c_tgt_frame_idx"] = frame_idx
-            frame_pil = to_pil_image(sample.video[frame_idx].clamp(0, 1))
-            batch_pil.append([frame_pil])
+        for img in images:
+            batch_pil.append([img] if img is not None else [])
 
-        # preprocess_func needs rembg_model + image_encoder on GPU; they were
-        # offloaded to CPU after dataset preprocessing (_init_dataloader).
-        # Only load these two — sparse_structure_flow_model is also a preprocessing
-        # module but is the trainable transformer; offloading it would break forward.
         _preprocess_only = ["rembg_model", "image_encoder"]
         device = self.accelerator.device
         self.adapter.on_load_components(components=_preprocess_only, device=device)
