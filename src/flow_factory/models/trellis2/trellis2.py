@@ -87,6 +87,8 @@ from trellis2.utils import render_utils
 
 from .chunked_mixin import ChunkedDecoderMixin
 from .pbr_mesh_renderer_chunked import render_frames_chunked
+from .trellis2_cameras import get_render_cameras
+from flow_factory.trainers.trellis2_opd import compute_voxel_visibility
 
 
 def _build_viridis_lut() -> torch.Tensor:
@@ -2943,13 +2945,12 @@ class Trellis2Adapter(BaseAdapter):
                 textured_mesh = mesh
 
             if compute_visibility_masks and h is not None:
-                masks, vis_heatmap = self._compute_visibility_from_h(
+                masks = self._compute_visibility_from_h(
                     h, sample, num_frames,
                     mode=visibility_mask_mode,
                     target_res=visibility_mask_target_res,
                 )
                 sample.extra_kwargs["visibility_masks"] = masks
-                sample.extra_kwargs.setdefault("_log_panels", []).append(vis_heatmap)
                 del h
 
             torch.cuda.empty_cache()
@@ -2979,18 +2980,8 @@ class Trellis2Adapter(BaseAdapter):
         num_frames: int,
         mode: str = "any",
         target_res: int = 16,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute per-frame visibility masks and viridis heatmaps.
-
-        Returns:
-            (masks, heatmap):
-                masks: (num_frames, target_res, target_res, target_res) float32 CPU.
-                heatmap: (num_frames, 3, H, W) float32 CPU — viridis-colored per-pixel
-                    visibility count, suitable for direct logging as a video panel.
-        """
-        from .trellis2_cameras import get_render_cameras
-        from flow_factory.trainers.trellis2_opd import compute_voxel_visibility
-
+    ) -> torch.Tensor:
+        """Compute per-frame visibility masks (target_res³ grid)."""
         ss_resolution = 32 if (sample.resolution or 1024) <= 512 else 64
         effective_res = ss_resolution * 16
 
@@ -3022,11 +3013,6 @@ class Trellis2Adapter(BaseAdapter):
 
         extrinsics_list, intrinsics_list = get_render_cameras(num_frames)
         render_res = 512
-        viridis = _VIRIDIS_LUT.to(device)  # (256, 3)
-
-        # Accumulate per-voxel visibility count across all frames for heatmap
-        vis_count_total = torch.zeros(N, device=device)
-        heatmap_frames = []
 
         for fi in range(num_frames):
             extr = extrinsics_list[fi].to(device)
@@ -3034,18 +3020,7 @@ class Trellis2Adapter(BaseAdapter):
             visible, voxel_id = compute_voxel_visibility(
                 coords_3d, extr, intr, voxel_size, render_resolution=render_res
             )
-            vis_count_total += visible.float()
             visible_latent = all_latent_coords[visible]
-
-            # Per-pixel heatmap: map voxel_id → accumulated visibility count → viridis
-            heatmap_hw = torch.zeros(render_res, render_res, 3, device=device)
-            fg = voxel_id >= 0  # (H, W)
-            ids = voxel_id[fg].long()  # per-pixel voxel index
-            counts = vis_count_total[ids]  # per-pixel accumulated count
-            normed = (counts / max(fi + 1, 1)).clamp(0, 1)
-            lut_idx = (normed * 255).long().clamp(0, 255)
-            heatmap_hw[fg] = viridis[lut_idx]
-            heatmap_frames.append(heatmap_hw.permute(2, 0, 1).cpu())  # (3, H, W)
 
             if visible_latent.numel() == 0:
                 continue
@@ -3069,8 +3044,62 @@ class Trellis2Adapter(BaseAdapter):
                 elif mode == "all":
                     all_frame_masks[fi] = (ratio >= 1.0).float().cpu()
 
-        heatmap_video = torch.stack(heatmap_frames)  # (T, 3, H, W) float32 CPU
-        return all_frame_masks, heatmap_video
+        sample.extra_kwargs["_vis_coords_3d"] = coords_3d.cpu()
+        sample.extra_kwargs["_vis_voxel_size"] = voxel_size
+
+        return all_frame_masks
+
+    @torch.no_grad()
+    def generate_target_heatmap(
+        self,
+        sample: Trellis2Sample,
+        target_frame_idx: int,
+        num_frames: int,
+        render_resolution: int = 512,
+    ) -> Optional[torch.Tensor]:
+        """Binary heatmap: target-visible voxels highlighted across all render views.
+
+        Uses coords stored by ``_compute_visibility_from_h``. Returns
+        (num_frames, 3, H, W) float32 CPU, or None if coords unavailable.
+        """
+        coords_3d = sample.extra_kwargs.pop("_vis_coords_3d", None)
+        voxel_size = sample.extra_kwargs.pop("_vis_voxel_size", None)
+        if coords_3d is None:
+            return None
+
+        device = self.device
+        coords_3d = coords_3d.to(device)
+        viridis = _VIRIDIS_LUT.to(device)
+
+        extrinsics_list, intrinsics_list = get_render_cameras(num_frames)
+
+        tgt_visible, _ = compute_voxel_visibility(
+            coords_3d,
+            extrinsics_list[target_frame_idx].to(device),
+            intrinsics_list[target_frame_idx].to(device),
+            voxel_size,
+            render_resolution,
+        )
+
+        heatmap_frames = []
+        for fi in range(num_frames):
+            _, voxel_id = compute_voxel_visibility(
+                coords_3d,
+                extrinsics_list[fi].to(device),
+                intrinsics_list[fi].to(device),
+                voxel_size,
+                render_resolution,
+            )
+            heatmap_hw = torch.zeros(
+                render_resolution, render_resolution, 3, device=device
+            )
+            fg = voxel_id >= 0
+            ids = voxel_id[fg].long()
+            lut_idx = (tgt_visible[ids].float() * 255).long()
+            heatmap_hw[fg] = viridis[lut_idx]
+            heatmap_frames.append(heatmap_hw.permute(2, 0, 1).cpu())
+
+        return torch.stack(heatmap_frames)
 
     def render_mesh(
         self,
@@ -3087,8 +3116,6 @@ class Trellis2Adapter(BaseAdapter):
         """Render a decoded mesh into multiview frames and write to *sample*."""
         if envmap is None:
             envmap = self._build_envmap(envmap_path)
-
-        from .trellis2_cameras import get_render_cameras
 
         extrinsics, intrinsics = get_render_cameras(num_frames)
         # nvdiffrast 在 faces > ~16M (2^24) 时会触发 subtriangle count overflow，

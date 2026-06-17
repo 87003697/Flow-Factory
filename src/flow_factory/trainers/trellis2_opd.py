@@ -250,15 +250,8 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
             return
         self._encode_c_tgt(samples, self._tgt_buffer.get_images())
         self._tgt_buffer.clear()
-        if self.training_args.use_visibility_mask:
-            _build_vis = (
-                self._build_visibility_masks_sparse
-                if self._training_stage != "dense"
-                else self._build_visibility_masks_dense
-            )
-            _build_vis(samples)
-        if self.accelerator.is_main_process:
-            self.log_data({"train_samples": samples[:2]}, step=self.step)
+        self._build_visibility(samples)
+        self._log_train_samples(samples)
 
     # =============================== Optimization ===============================
 
@@ -334,6 +327,46 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
             sample.extra_kwargs["visibility_mask"] = frame_mask[
                 coords[:, 0], coords[:, 1], coords[:, 2]
             ].to(self.accelerator.device)  # (N_b,) float per-voxel visibility
+
+    # -- prepare_feedback helpers: visibility dispatch + logging -------------------
+
+    @torch.no_grad()
+    def _build_visibility(self, samples: List[BaseSample]) -> None:
+        """Dispatch to sparse/dense visibility mask builder (no-op if disabled)."""
+        if not self.training_args.use_visibility_mask:
+            return
+        build = (
+            self._build_visibility_masks_sparse
+            if self._training_stage != "dense"
+            else self._build_visibility_masks_dense
+        )
+        build(samples)
+
+    def _log_train_samples(self, samples: List[BaseSample]) -> None:
+        """Attach diagnostic panels and log the first 2 samples to the logger."""
+        if not self.accelerator.is_main_process:
+            return
+        # Attach visibility heatmap overlay before logging
+        if self.training_args.use_visibility_mask:
+            for s in samples:
+                self._attach_visibility_heatmap(s)
+        self.log_data({"train_samples": samples[:2]}, step=self.step)
+
+    def _attach_visibility_heatmap(self, sample: BaseSample) -> None:
+        """Generate binary heatmap showing target-visible voxels across all views.
+
+        Calls adapter.generate_target_heatmap() which does ray-cube intersection
+        from the target camera to find visible voxels, then renders them in
+        viridis (yellow = target-visible, purple = not) from every render view.
+        Result is appended to _log_panels for LogFormatter to pick up.
+        """
+        tgt_idx = sample.extra_kwargs.get("c_tgt_frame_idx")
+        if tgt_idx is None:
+            return
+        num_frames = sample.video.shape[0] if sample.video is not None else 24
+        heatmap = self.adapter.generate_target_heatmap(sample, tgt_idx, num_frames)
+        if heatmap is not None:
+            sample.extra_kwargs.setdefault("_log_panels", []).append(heatmap)
 
     # =============================== PASS 1: teacher targets ===============================
 
