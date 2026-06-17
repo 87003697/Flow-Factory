@@ -68,6 +68,8 @@ class Trellis2TrainerMixin:
 
     def _dist_any_error(self, local_error: bool) -> bool:
         """Return True if *any* rank reports an error (all_reduce MAX)."""
+        if self.accelerator.num_processes == 1:
+            return local_error
         flag = torch.tensor(
             [int(local_error)],
             dtype=torch.int32,
@@ -177,18 +179,6 @@ class Trellis2TrainerMixin:
             type(model).__name__,
             list(model.rope_phases.shape),
         )
-
-    def _set_transformer_checkpoint(self, enabled: bool) -> None:
-        """Toggle gradient checkpointing on the training-stage transformer."""
-        model = self.adapter.pipeline.transformer
-        if not hasattr(model, "blocks"):
-            return
-        count = 0
-        for block in model.blocks:
-            if hasattr(block, "use_checkpoint"):
-                block.use_checkpoint = enabled
-                count += 1
-        logger.info("Set use_checkpoint=%s on %d blocks", enabled, count)
 
     # Rollout helpers
 
@@ -301,19 +291,32 @@ class Trellis2TrainerMixin:
             uid_to_owner,
         )
 
-        # Even failed uids must run the status broadcast; otherwise peer ranks
-        # block forever in dist.broadcast(status).
+        # Single-process: no broadcast needed, directly assign pilot data.
+        # Multi-process: even failed uids must run the status broadcast;
+        # otherwise peer ranks block forever in dist.broadcast(status).
         any_failed = False
-        for uid in sorted(uid_to_owner):
-            ok = self._broadcast_upstream_for_uid(
-                uid,
-                uid_to_owner[uid],
-                pilot_results,
-                samples,
-                failed_uids,
-            )
-            if not ok:
-                any_failed = True
+        if self.accelerator.num_processes == 1:
+            any_failed = bool(failed_uids)
+            for uid, pilot in pilot_results.items():
+                for s in samples:
+                    if s.unique_id != uid:
+                        continue
+                    s.sparse_coords = pilot.sparse_coords.clone()
+                    s.sparse_coords[:, 0] = 0
+                    s.dense_final_latent = pilot.dense_final_latent.clone()
+                    if pilot.shape_final_latent is not None:
+                        s.shape_final_latent = pilot.shape_final_latent.clone()
+        else:
+            for uid in sorted(uid_to_owner):
+                ok = self._broadcast_upstream_for_uid(
+                    uid,
+                    uid_to_owner[uid],
+                    pilot_results,
+                    samples,
+                    failed_uids,
+                )
+                if not ok:
+                    any_failed = True
 
         if any_failed:
             raise _WindowOOMSkipped("OOM during upstream pilot stage")
@@ -322,6 +325,10 @@ class Trellis2TrainerMixin:
     def _resolve_rollout_resolution(self) -> int:
         """Resolve scalar Trellis2 resolution from training args."""
         return self.adapter._as_scalar_resolution(self.training_args.resolution)
+
+    def _infer_ss_resolution(self) -> int:
+        """Sparse structure grid resolution (32 for ≤512, 64 for 1024)."""
+        return 32 if self._resolve_rollout_resolution() <= 512 else 64
 
     def _create_sample_stubs(
         self,

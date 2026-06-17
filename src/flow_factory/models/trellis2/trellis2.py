@@ -1574,6 +1574,8 @@ class Trellis2Adapter(BaseAdapter):
         samples: Optional[List["Trellis2Sample"]] = None,
         # Training: visibility mask computation
         compute_visibility_masks: bool = False,
+        visibility_mask_mode: str = "any",
+        visibility_mask_target_res: int = 16,
         **kwargs,
     ) -> List[Trellis2Sample]:
         """Multi-stage inference dispatcher for Trellis2.
@@ -1719,6 +1721,8 @@ class Trellis2Adapter(BaseAdapter):
                     render_mode=render_mode,
                     envmap=envmap,
                     compute_visibility_masks=compute_visibility_masks,
+                    visibility_mask_mode=visibility_mask_mode,
+                    visibility_mask_target_res=visibility_mask_target_res,
                 )
 
         return samples
@@ -2841,6 +2845,8 @@ class Trellis2Adapter(BaseAdapter):
         envmap_path: Optional[str] = None,
         render_mode: Literal["shaded", "clay", "normal"] = "shaded",
         compute_visibility_masks: bool = False,
+        visibility_mask_mode: str = "any",
+        visibility_mask_target_res: int = 16,
         **render_kwargs,
     ) -> Trellis2Sample:
         """Decode latents to mesh and render deterministic multiview frames.
@@ -2920,8 +2926,8 @@ class Trellis2Adapter(BaseAdapter):
             if compute_visibility_masks and h is not None:
                 masks = self._compute_visibility_from_h(
                     h, sample, num_frames,
-                    mode=render_kwargs.get("visibility_mask_mode", "any"),
-                    target_res=render_kwargs.get("visibility_mask_target_res", 16),
+                    mode=visibility_mask_mode,
+                    target_res=visibility_mask_target_res,
                 )
                 sample.extra_kwargs["visibility_masks"] = masks
                 del h

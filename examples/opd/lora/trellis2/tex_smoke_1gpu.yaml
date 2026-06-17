@@ -1,0 +1,118 @@
+# Trellis2 OPD self-distillation: tex stage — 1 GPU smoke test.
+
+launcher: "accelerate"
+config_file: null
+num_processes: 1
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  datasets:
+    - name: default
+      dataset_dir: "dataset/trellis2"
+      train:
+        weight: 1
+        max_dataset_size: null
+      eval: {}
+  preprocessing_batch_size: 4
+  dataloader_num_workers: 8
+  force_reprocess: false
+  cache_dir: "/data/zhiyuan_ma/.cache/flow_factory/datasets"
+  dataset_type: "image_3d"
+  sampler_type: "distributed_group_aligned"
+
+model:
+  finetune_type: 'lora'
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "pretrained_weights/TRELLIS.2-4B"
+  model_type: "trellis2"
+  resume_path: null
+  resume_type: null
+  target_flow_model: "tex_slat_1024"
+  decode_output: true
+  render_num_frames: 16
+  render_resolution: 512
+  render_mode: "shaded"
+  render_bg_color: [0, 0, 0]
+  envmap_path: null
+  dense_sde:
+    dynamics_type: "ODE"
+  shape_sde:
+    dynamics_type: "ODE"
+
+log:
+  run_name: null
+  project: "Flow-Factory"
+  logging_backend: "none"
+  save_dir: "saves/"
+  save_freq: 1
+  save_model_only: true
+
+train:
+  trainer_type: 'trellis2_opd'
+
+  resolution: 1024
+  num_inference_steps: 12
+  timestep_range: 0.99
+
+  per_device_batch_size: 2
+  group_size: 2
+  unique_sample_num_per_epoch: 4
+  num_inner_epochs: 1
+  gradient_step_per_epoch: 4
+  gradient_accumulation_steps: 1
+
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  max_epochs: 1
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cpu"
+
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: false
+  seed: 42
+
+  teacher_frame_strategy: "random"
+  ref_kl_beta: 0.0
+  use_visibility_mask: true
+  visibility_mask_mode: "soft"
+
+scheduler:
+  dynamics_type: "Flow-SDE"
+  noise_level: 1.0
+  num_sde_steps: 1
+  sde_steps: [1, 2, 3]
+  seed: 42
+
+eval:
+  resolution: 1024
+  per_device_batch_size: 1
+  num_inference_steps: 12
+  eval_freq: 1
+  seed: 42
+
+rewards:
+  - name: "pickscore"
+    reward_model: "PickScore"
+    weight: 1.0
+    batch_size: 8
+    device: "cuda"
+    dtype: bfloat16
+    async_reward: true
+    num_workers: 1
+
+eval_rewards:
+  name: "pickscore"
+  reward_model: "PickScore"
+  batch_size: 8
+  device: "cuda"
+  dtype: bfloat16
+  async_reward: true
+  num_workers: 1

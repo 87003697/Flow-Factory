@@ -34,16 +34,6 @@ class Trellis2OPDTrainingArguments(TrainingArguments):
         default="random",
         metadata={"help": "How to select c_tgt frame from student rollout video."},
     )
-    disable_grad_checkpoint_for_distill: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Disable gradient checkpointing on the training-stage transformer "
-                "during the distillation backward pass.  Required for dense stage "
-                "whose inplace FFT ops conflict with activation recomputation."
-            )
-        },
-    )
     ref_kl_beta: float = field(
         default=0.0,
         metadata={
