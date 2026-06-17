@@ -89,6 +89,7 @@ QWEN_TAR="${S3_DATA}/qwen-image-edit-2511.tar"    # Qwen Guidance（UnifiedRewar
 DATASET_TAR="${S3_DATA}/alphaimages_v2.tar"        # 训练数据集（含 prompt caption）
 REFERENCE_TAR="${S3_DATA}/trellis2_reference.tar"  # TRELLIS.2 源码包
 CUDA_SP_TAR="${S3_DATA}/cuda_site_packages.tar"    # 预编译 CUDA 扩展
+FLASH_ATTN_TAR="${S3_DATA}/flash_attn_273_torch260_cu124.tar"  # 预编译 flash-attn wheel
 TRELLIS1_TAR="${S3_DATA}/TRELLIS-image-large.tar"  # 原版 TRELLIS v1 共享组件（ss_dec 等）
 
 # 本地高速盘路径（Pod 生命周期内有效，重启后丢失）
@@ -101,6 +102,9 @@ cd "${PROJECT_DIR}"
 # --- 环境变量 ---
 # Prevent `uv run` from re-resolving all extras (geneval → mmcv build fails on Python 3.12)
 export UV_FROZEN=1
+# Prevent `uv run` from syncing the environment to match the lockfile (which has torch 2.12)
+# after we manually downgrade to torch 2.6.0+cu124 in step [2/7]
+export UV_NO_SYNC=1
 # 把 venv 的 bin 加到 PATH 最前面，确保 python/ninja/ff-train 等命令可用
 export PATH="${VENV}/bin:${PATH}"
 # 告诉 uv 把包装到这个 venv（而非项目内 .venv）
@@ -202,15 +206,26 @@ else
 fi
 
 # flash-attn: Trellis2 sparse transformer 的高效注意力实现
-# --no-build-isolation: flash-attn 的 setup.py 需要先有 wheel/setuptools/torch
-# 首次编译 ~3min（从源码），后续有 uv wheel cache 命中只需 ~7s
-if ! "${VENV}/bin/python" -c "import flash_attn" 2>/dev/null; then
-    echo "  Compiling flash-attn (~3 min or cache hit ~5s)..."
+# 从源码编译需 ~24min（H200 首次），S3 tar 恢复只需 ~3s。
+# 首次编译后自动打包上传 S3，后续 pod 直接恢复。
+SITE_PKG="${VENV}/lib/python3.12/site-packages"
+if "${VENV}/bin/python" -c "import flash_attn" 2>/dev/null; then
+    echo "  flash-attn already installed"
+elif s5cmd ls "${FLASH_ATTN_TAR}" &>/dev/null; then
+    echo "  Restoring flash-attn from S3 tar..."
+    s5cmd cat "${FLASH_ATTN_TAR}" | tar xf - -C "${SITE_PKG}/"
+    echo "  Restored (~3s)"
+else
+    echo "  Compiling flash-attn 2.7.3 from source (~24 min)..."
     uv pip install --python "${VENV}/bin/python" wheel setuptools 2>/dev/null
     uv pip install --python "${VENV}/bin/python" \
         --no-build-isolation flash-attn==2.7.3 2>&1 | tail -3
-else
-    echo "  flash-attn already installed"
+    echo "  Uploading flash-attn tar to S3 for future pods..."
+    # shellcheck disable=SC2046
+    tar cf - -C "${SITE_PKG}" \
+        $(cd "${SITE_PKG}" && ls -d flash_attn flash_attn*.so flash_attn*.dist-info 2>/dev/null) \
+        | s5cmd pipe "${FLASH_ATTN_TAR}" || echo "  WARNING: tar upload failed (non-fatal)"
+    echo "  Cached to ${FLASH_ATTN_TAR}"
 fi
 
 # ============================================================================
