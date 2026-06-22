@@ -80,6 +80,7 @@ def _setup_trellis_path():
 _trellis_path = _setup_trellis_path()
 
 from o_voxel.convert import flexible_dual_grid_to_mesh
+import o_voxel.rasterize
 from trellis2.modules.sparse import SparseTensor
 from trellis2.renderers.pbr_mesh_renderer import EnvMap
 from trellis2.representations import Mesh, MeshWithVoxel
@@ -88,7 +89,31 @@ from trellis2.utils import render_utils
 from .chunked_mixin import ChunkedDecoderMixin
 from .pbr_mesh_renderer_chunked import render_frames_chunked
 from .trellis2_cameras import get_render_cameras
-from flow_factory.trainers.trellis2_opd import compute_voxel_visibility
+
+
+def compute_voxel_visibility(
+    coords_3d: torch.Tensor,
+    extrinsics: torch.Tensor,
+    intrinsics: torch.Tensor,
+    voxel_size: float,
+    render_resolution: int = 512,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Voxel visibility via o_voxel cube rasterization (ray-cube intersection).
+
+    Returns:
+        (visible, voxel_id): Boolean mask (N,) and per-pixel hit index (H, W).
+    """
+    device = coords_3d.device
+    N = coords_3d.shape[0]
+    attrs = torch.zeros(N, 1, device=device)
+    renderer = o_voxel.rasterize.VoxelRenderer({"resolution": render_resolution})
+    ret = renderer.render(coords_3d, attrs, voxel_size, extrinsics, intrinsics)
+    voxel_id = ret["voxel_id"]
+    visible_ids = voxel_id.unique()
+    visible_ids = visible_ids[visible_ids >= 0]
+    visible = torch.zeros(N, dtype=torch.bool, device=device)
+    visible[visible_ids.long()] = True
+    return visible, voxel_id
 
 
 def _build_viridis_lut() -> torch.Tensor:
