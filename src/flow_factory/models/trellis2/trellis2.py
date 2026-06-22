@@ -79,12 +79,12 @@ def _setup_trellis_path():
 
 _trellis_path = _setup_trellis_path()
 
-from o_voxel.convert import flexible_dual_grid_to_mesh
-import o_voxel.rasterize
 from trellis2.modules.sparse import SparseTensor
 from trellis2.renderers.pbr_mesh_renderer import EnvMap
 from trellis2.representations import Mesh, MeshWithVoxel
 from trellis2.utils import render_utils
+import o_voxel.rasterize
+from o_voxel.convert import flexible_dual_grid_to_mesh
 
 from .chunked_mixin import ChunkedDecoderMixin
 from .pbr_mesh_renderer_chunked import render_frames_chunked
@@ -2728,6 +2728,7 @@ class Trellis2Adapter(BaseAdapter):
         )
         intersected = h.replace(h.feats[..., 3:6] > 0)
         quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
+
         meshes = [
             Mesh(
                 *flexible_dual_grid_to_mesh(

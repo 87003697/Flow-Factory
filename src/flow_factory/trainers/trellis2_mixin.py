@@ -94,12 +94,12 @@ class Trellis2TrainerMixin:
 
         K = self.training_args.group_size
         bs = self.training_args.per_device_batch_size
-        if K % bs != 0:
-            raise ValueError(
-                f"group_size ({K}) must be divisible by "
-                f"per_device_batch_size ({bs}) for batch accumulation."
-            )
         if self.config.data_args.sampler_type == "group_contiguous":
+            if K % bs != 0:
+                raise ValueError(
+                    f"group_size ({K}) must be divisible by "
+                    f"per_device_batch_size ({bs}) for batch accumulation."
+                )
             self._batches_to_merge = K // bs
         else:
             self._batches_to_merge = 1

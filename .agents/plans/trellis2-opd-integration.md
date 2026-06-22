@@ -512,3 +512,242 @@ C2（`_extra_kwargs_keys` 不存在）、W1（`return_kwargs` 被吞）、W2（m
 
 C1 的真因是 **trellis2 分支 18 commit 落后 origin/main**，不是基础设施未合并。**最该补的是 Step 0 改成 "sync trellis2 ← origin/main"**，sync 后 OPD 基础设施 + hparams 拆包结构直接获得，本期工作回到 4 个新文件的原始路径。
 
+---
+
+### Review · 2026-06-08 · 三轮（Error #6: gradient checkpointing + inplace FFT）
+
+> **触发**：Koala job `ericzyma-job-normal-20260608-151217` 在 `_distill` backward 崩溃。训练已跑过 eval（pickscore=0.7242）、sampling（4 windows）、`_compute_c_tgt`、`_precompute_mu_T`（100% teacher targets in 8s），在 `_distill` 的 `accelerator.backward(loss)` 处失败。
+
+#### 根因
+
+Dense transformer (`sparse_structure_flow_model`) 的 TRELLIS.2 后端包含 **inplace FFT 操作**。当 `enable_gradient_checkpointing: true` 时，backward pass 尝试 **recompute** forward，但 inplace 操作已改变原始 tensor，recompute 看到被污染的输入后崩溃。
+
+这是 gradient checkpointing 的已知限制：checkpoint 机制释放中间 activation → backward 时重新 forward → 如果 forward 中有 inplace 操作，重新 forward 的输入已被修改 → 结果不一致 → 报错。
+
+#### 各 stage 情况
+
+| Stage | Model | Block 类型 | 有 inplace FFT？ | Grad ckpt 冲突？ |
+|-------|-------|-----------|-----------------|-----------------|
+| Dense | `sparse_structure_flow_model` | Standard transformer | **是** | **是** — backward recompute 时崩溃 |
+| Shape | `shape_slat_flow_model_{512,1024}` | `ModulatedSparseTransformerCrossBlock` | **否** | 否 — sparse attention, 无 FFT |
+| Tex | `tex_slat_flow_model_{512,1024}` | `ModulatedSparseTransformerCrossBlock` | **否** | 否 — sparse attention, 无 FFT |
+
+#### 设计：YAML config flag + `_set_transformer_checkpoint()` in mixin
+
+**思路**：是否在 distill 时 disable gradient checkpointing 由 **config 控制**。Dense stage 需要 disable（inplace FFT 冲突），shape/tex 不需要。各 stage 的 YAML 自行决定。
+
+**1. 新增 training arg 字段**（`Trellis2OPDTrainingArguments`）：
+
+```python
+disable_grad_checkpoint_for_distill: bool = field(
+    default=False,
+    metadata={"help": "Disable gradient checkpointing during _distill backward. "
+              "Required for dense stage (inplace FFT ops conflict with recompute)."},
+)
+```
+
+**2. Mixin helper**（`Trellis2TrainerMixin`）：
+
+```python
+def _set_transformer_checkpoint(self, enabled: bool) -> None:
+    """Toggle gradient checkpointing on the training-stage transformer."""
+    model = self.adapter.pipeline.transformer
+    if not hasattr(model, "blocks"):
+        return
+    for block in model.blocks:
+        if hasattr(block, "use_checkpoint"):
+            block.use_checkpoint = enabled
+```
+
+**3. 调用点**（`trellis2_opd.py:optimize()`）：
+
+```python
+if self.training_args.disable_grad_checkpoint_for_distill:
+    self._set_transformer_checkpoint(False)
+self._distill(samples, train_timesteps)
+if self.training_args.disable_grad_checkpoint_for_distill:
+    self._set_transformer_checkpoint(True)
+```
+
+**4. YAML 配置**：
+- `dense_self_distill.yaml`: `disable_grad_checkpoint_for_distill: true`
+- 未来 shape/tex yaml: 不设或 `false`（默认值）
+
+**为什么这样设计：**
+- Dense 有 inplace FFT 冲突，必须 disable → config 设 true
+- Shape/tex 无此问题，保持 checkpointing 节省显存 → 默认 false
+- 未来如果其他 stage 也出现类似问题，yaml 里开一个 flag 即可，不用改代码
+- `_set_transformer_checkpoint` 放 mixin 供所有 Trellis2 trainer 复用
+
+#### 修改文件
+
+1. **`src/flow_factory/hparams/training_args/trellis2_opd.py`** — 新增 `disable_grad_checkpoint_for_distill: bool = False` 字段
+2. **`src/flow_factory/trainers/trellis2_mixin.py`** — 新增 `_set_transformer_checkpoint(self, enabled: bool)` 方法（~8 LOC）
+3. **`src/flow_factory/trainers/trellis2_opd.py`** — `optimize()` 中用 `if self.training_args.disable_grad_checkpoint_for_distill:` 包裹 toggle 调用
+4. **`examples/opd/lora/trellis2/dense_self_distill.yaml`** — 加 `disable_grad_checkpoint_for_distill: true`
+
+#### 验证
+
+1. 重新提交 Koala → `_distill` backward 应通过（不再有 inplace FFT recompute 错误）
+2. 检查 `_precompute_mu_T` 仍正常工作（`torch.no_grad()` 下 checkpointing 不生效，不受影响）
+3. 确认 `train/kl_div` 有实际值输出（证明 backward + optimizer step 完成）
+
+---
+
+### Review · 2026-06-08 · 四轮（三轮 fix 无效 → 真因：rope_phases complex buffer version tracking）
+
+> **触发**：三轮的 gradient checkpointing toggle fix 提交后（job `ericzyma-job-normal-20260608-165233`），`_distill` backward **仍然崩溃**，报完全相同的错误：
+> ```
+> RuntimeError: one of the variables needed for gradient computation has been modified
+> by an inplace operation: [CUDAComplexFloatType [4096, 1, 64]] is at version 3; expected version 2
+> ```
+
+#### 三轮诊断为什么错了
+
+三轮假设"inplace FFT 操作在 gradient checkpointing recompute 时导致 tensor 被污染"——但出错的 tensor 类型是 **`CUDAComplexFloatType [4096, 1, 64]`**，这不是任何 FFT 中间结果。下载 TRELLIS.2 后端源码后发现：
+
+- `[4096, 1, 64]` complex = `self.rope_phases.unsqueeze(-2)`（`rope.py:31`）
+- `self.rope_phases` 是 `SparseStructureFlowModel` 的 registered buffer（`sparse_structure_flow.py:113`），形状 `[4096, 64]` complex64
+- 4096 = 16³（voxel 位置数），64 = head_dim / 2
+- 关闭 gradient checkpointing 并不解决这个问题——version tracking 冲突发生在 autograd 图内部
+
+#### 真正的根因
+
+**`self.rope_phases`（complex64, [4096, 64]）作为 registered buffer 被 30 个 transformer block 共享使用。**
+
+在 `sparse_structure_flow.py:240` 的 forward 循环中：
+```python
+for block in self.blocks:  # 30 blocks
+    h = block(h, t_emb, cond, self.rope_phases)  # 同一个 buffer
+```
+
+每个 block 的 `apply_rotary_embedding`（`rope.py:29-33`）执行：
+```python
+x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+x_rotated = x_complex * phases.unsqueeze(-2)  # autograd 保存 phases view
+x_embed = torch.view_as_real(x_rotated).reshape(...).to(x.dtype)
+```
+
+`phases.unsqueeze(-2)` 创建 `self.rope_phases` 的 view（shape [4096, 1, 64]），autograd 为 `*` 运算的 backward 保存这个 view 及其 version counter。
+
+**关键交互**：当 `use_reentrant=False` 的 gradient checkpointing 在 backward 时重计算 forward：
+1. checkpoint 保存所有 tensor 输入（包括 `phases`）及其 version
+2. 30 个 block 的 checkpoint boundary 都保存同一个 `self.rope_phases` buffer
+3. `torch.view_as_complex` / `view_as_real` 在 complex tensor 上的 version tracking 与 checkpoint 的 version 验证产生冲突
+4. backward recompute block N 时，检测到 `phases` 的 version 与 checkpoint 时不一致 → crash
+
+**但即使关闭 checkpointing**（三轮 fix），普通 autograd 在 backward 处理多个 block 时也可能遇到类似问题——因为 PyTorch 对 complex tensor view 的 version tracking 存在微妙的 edge case（同一 storage 的多个 view 在 autograd 图中的 version 可能被非预期地递增）。
+
+#### 修复方案：每次 forward 前 clone rope_phases
+
+**核心思路**：在 `SparseStructureFlowModel.forward` 执行 block 循环之前，**clone `self.rope_phases` 一次**。克隆出的副本有独立的 version counter，与原始 buffer 的 storage 完全隔离，autograd 不会再检测到 version mismatch。
+
+**开销**：每次 forward 多一个 4096 × 64 × 8 bytes = **2 MB** 的 clone，可以忽略不计。
+
+**实现方式**：在 `Trellis2TrainerMixin` 中 monkey-patch 模型的 forward 方法（因为 TRELLIS.2 后端代码在 S3 tar 中，不宜直接修改）：
+
+```python
+def _patch_rope_phases_clone(self) -> None:
+    """Monkey-patch transformer forward to clone rope_phases per call.
+
+    The dense transformer's rope_phases buffer (complex64, [4096, 64])
+    is shared across all 30 blocks. Autograd saves views of it for
+    backward, and version-counter conflicts arise between checkpoint
+    boundaries. Cloning once per forward gives autograd a fresh tensor
+    with its own version counter.
+    """
+    model = self.adapter.pipeline.transformer
+    if not hasattr(model, "rope_phases") or model.rope_phases is None:
+        return
+
+    _orig_forward = model.forward
+
+    def _forward_with_cloned_phases(x, t, cond):
+        orig_buf = model.rope_phases
+        model.rope_phases = orig_buf.clone()
+        try:
+            return _orig_forward(x, t, cond)
+        finally:
+            model.rope_phases = orig_buf
+
+    model.forward = _forward_with_cloned_phases
+    logger.info("Patched %s.forward to clone rope_phases per call",
+                type(model).__name__)
+```
+
+**调用时机**：在 `_init_trellis2()` 末尾调用 `self._patch_rope_phases_clone()`，对所有 Trellis2 trainer 生效。
+
+#### 与三轮 fix 的关系
+
+| Fix | 作用 | 是否保留 |
+|-----|------|---------|
+| `_patch_rope_phases_clone()` | **根因修复**——消除 version tracking 冲突 | ✅ 保留 |
+| `disable_grad_checkpoint_for_distill` flag + `_set_transformer_checkpoint()` | **辅助防御**——减少 checkpoint 带来的额外 version 检查 | ✅ 保留（作为 config 选项） |
+
+两个 fix 可以独立工作。clone fix 是根本修复；checkpointing toggle 是额外的安全网。当 clone fix 验证成功后，可以在 YAML 中设 `disable_grad_checkpoint_for_distill: false` 恢复 checkpointing 以节省显存。
+
+#### 修改文件
+
+1. **`src/flow_factory/trainers/trellis2_mixin.py`** — 新增 `_patch_rope_phases_clone()` 方法（~20 LOC），在 `_init_trellis2()` 末尾调用。同时给 `_set_transformer_checkpoint()` 加日志确认 toggle 生效
+2. **`src/flow_factory/trainers/trellis2_opd.py`** — 无需额外修改（patch 通过 mixin init 自动应用）
+
+#### 验证
+
+1. 重新提交 Koala → `_distill` backward 应通过（rope_phases clone 消除 version mismatch）
+2. 日志中应出现 `"Patched SparseStructureFlowModel.forward to clone rope_phases per call"` + `"Set use_checkpoint=False on 30 blocks"`
+3. 确认 `train/kl_div` 有实际值输出（证明 backward + optimizer step 完成）
+4. 后续验证：设 `disable_grad_checkpoint_for_distill: false`，仅靠 clone fix 是否足够
+
+---
+
+### Review · 2026-06-22 · 五轮（group_size 约束过严）
+
+> **触发**：shape self-distillation 训练提交时因 `group_size (1) must be divisible by per_device_batch_size (2)` 报错。临时改 group_size=2 绕过，但发现该约束对非 `group_contiguous` sampler 无意义。
+
+#### 问题
+
+`trellis2_mixin.py` L95-101 的 `K % bs != 0` 检查是**无条件执行**的，但 `_batches_to_merge` 只在 `sampler_type == "group_contiguous"` 时 > 1。对于 `distributed_group_aligned`（当前默认 sampler），`_batches_to_merge = 1`，这个整除约束完全不生效——它计算出的值没有被使用。
+
+```python
+# 当前代码（L95-105）
+K = self.training_args.group_size
+bs = self.training_args.per_device_batch_size
+if K % bs != 0:  # ← 无条件检查，但只在 group_contiguous 下有意义
+    raise ValueError(...)
+if self.config.data_args.sampler_type == "group_contiguous":
+    self._batches_to_merge = K // bs
+else:
+    self._batches_to_merge = 1
+```
+
+**对比 dgpo**：`(num_processes * per_device_batch_size) % group_size == 0`（方向相反，允许 group_size < batch_size）。
+
+#### 修复
+
+将整除检查移入 `group_contiguous` 分支：
+
+```python
+K = self.training_args.group_size
+bs = self.training_args.per_device_batch_size
+if self.config.data_args.sampler_type == "group_contiguous":
+    if K % bs != 0:
+        raise ValueError(
+            f"group_size ({K}) must be divisible by "
+            f"per_device_batch_size ({bs}) for batch accumulation."
+        )
+    self._batches_to_merge = K // bs
+else:
+    self._batches_to_merge = 1
+```
+
+#### 影响
+
+- `shape_self_distill.yaml` 可以恢复 `group_size: 1`（OPD self-distill 不需要 group 语义）
+- 现有 `group_contiguous` 用户不受影响（约束仍在该分支内生效）
+- 这是 mixin 改动，影响所有 Trellis2 trainer（GRPO/NFT/OPD）
+
+#### 修改文件
+
+1. **`src/flow_factory/trainers/trellis2_mixin.py`** L95-105 — 重构约束位置
+2. **`examples/opd/lora/trellis2/shape_self_distill.yaml`** — 可选：`group_size` 改回 1
+
