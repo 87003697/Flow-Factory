@@ -2859,25 +2859,52 @@ class Trellis2Adapter(BaseAdapter):
         """Load an HDR environment map and return an EnvMap object.
 
         Args:
-            envmap_path: Path to an .exr HDR file.  When ``None``, falls back
+            envmap_path: Path to an .exr/.hdr file.  When ``None``, falls back
                 to the default ``forest.exr`` shipped with Trellis2.
 
         Returns:
             An ``EnvMap`` instance ready for ``PbrMeshRenderer.render()``.
         """
-        import cv2
+        import numpy as np
 
         if envmap_path is None:
             envmap_path = os.path.join(_trellis_path, "assets", "hdri", "forest.exr")
         assert os.path.exists(envmap_path), f"EnvMap HDR file not found: {envmap_path}"
 
-        os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
-        hdr_bgr = cv2.imread(envmap_path, cv2.IMREAD_UNCHANGED)  # (H, W, 3) float32 BGR
-        assert hdr_bgr is not None, f"Failed to load EnvMap HDR file: {envmap_path}"
-        hdr_rgb = cv2.cvtColor(hdr_bgr, cv2.COLOR_BGR2RGB)  # (H, W, 3) float32 RGB
+        hdr_rgb = None
+
+        # Try OpenEXR package first (most reliable for .exr)
+        if envmap_path.endswith(".exr"):
+            try:
+                import OpenEXR
+                import Imath
+                exr_file = OpenEXR.InputFile(envmap_path)
+                dw = exr_file.header()["dataWindow"]
+                h = dw.max.y - dw.min.y + 1
+                w = dw.max.x - dw.min.x + 1
+                pt = Imath.PixelType(Imath.PixelType.FLOAT)
+                channels = [
+                    np.frombuffer(exr_file.channel(c, pt), dtype=np.float32).reshape(h, w)
+                    for c in ("R", "G", "B")
+                ]
+                hdr_rgb = np.stack(channels, axis=-1)
+            except (ImportError, Exception):
+                pass
+
+        # Fallback: cv2 (works for .hdr always, .exr only if codec is available)
+        if hdr_rgb is None:
+            import cv2
+            os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+            hdr_bgr = cv2.imread(envmap_path, cv2.IMREAD_UNCHANGED)
+            assert hdr_bgr is not None, (
+                f"Failed to load EnvMap HDR file: {envmap_path}. "
+                f"Install 'openexr' package: pip install openexr"
+            )
+            hdr_rgb = cv2.cvtColor(hdr_bgr, cv2.COLOR_BGR2RGB)
+
         hdr_tensor = torch.tensor(
             hdr_rgb, dtype=torch.float32, device=self.device
-        )  # (H, W, 3) float32
+        )
         return EnvMap(hdr_tensor)
 
     @torch.no_grad()

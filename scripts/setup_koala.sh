@@ -120,6 +120,8 @@ export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Trellis2 sparse transformer 的注意力后端选择
 export ATTN_BACKEND=flash_attn
+# OpenCV EXR codec support (needed for envmap HDR loading)
+export OPENCV_IO_ENABLE_OPENEXR=1
 export WANDB_API_KEY="${WANDB_API_KEY}"
 # TRELLIS.2 源码加入 Python 搜索路径
 # trellis2.py 中有 sys.path.insert(0, "third_party/TRELLIS.2") 做同样的事，
@@ -200,6 +202,7 @@ else
         trimesh plyfile open3d kiui rembg onnxruntime \
         imageio-ffmpeg easydict opencv-python-headless ninja \
         kornia timm lpips pytorch-msssim zstandard \
+        openexr \
         "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8" \
         2>&1 | tail -3
     echo "  Done"
@@ -266,11 +269,25 @@ fi
 echo "=== [5/7] TRELLIS.2 reference code ==="
 if [ -d "${PROJECT_DIR}/third_party/TRELLIS.2/trellis2" ]; then
     echo "  Already present"
+    # Ensure envmap HDR assets exist
+    HDRI_DIR="${PROJECT_DIR}/third_party/TRELLIS.2/assets/hdri"
+    if [ ! -f "${HDRI_DIR}/forest.exr" ]; then
+        mkdir -p "${HDRI_DIR}"
+        s5cmd cp "${S3_DATA}/trellis2_hdri/forest.exr" "${HDRI_DIR}/forest.exr"
+        echo "  Downloaded envmap HDR"
+    fi
 elif s5cmd ls "${REFERENCE_TAR}" &>/dev/null; then
     echo "  Restoring from S3 tar..."
     mkdir -p "${PROJECT_DIR}/third_party"
     s5cmd cat "${REFERENCE_TAR}" | tar xf - -C "${PROJECT_DIR}/third_party/"
     echo "  Restored"
+    # Ensure envmap HDR assets exist (not included in some older tars)
+    HDRI_DIR="${PROJECT_DIR}/third_party/TRELLIS.2/assets/hdri"
+    if [ ! -f "${HDRI_DIR}/forest.exr" ]; then
+        mkdir -p "${HDRI_DIR}"
+        s5cmd cp "${S3_DATA}/trellis2_hdri/forest.exr" "${HDRI_DIR}/forest.exr"
+        echo "  Downloaded envmap HDR"
+    fi
 elif [ "$DOWNLOAD_MODE" = true ]; then
     echo "  Cloning TRELLIS.2..."
     mkdir -p "${PROJECT_DIR}/third_party"

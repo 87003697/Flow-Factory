@@ -60,8 +60,8 @@ train:
   timestep_range: 0.99
 
   per_device_batch_size: 2
-  group_size: 14
-  unique_sample_num_per_epoch: 4
+  group_size: 1
+  unique_sample_num_per_epoch: 64
   num_inner_epochs: 1
   gradient_step_per_epoch: 4
   gradient_accumulation_steps: 1
