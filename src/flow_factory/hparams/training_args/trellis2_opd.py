@@ -1,10 +1,45 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Tuple, Union
+from typing import Any, Dict, Literal, Optional, Tuple, Union
 
+from ..abc import ArgABC
 from ._base import TrainingArguments, _standardize_timestep_range
 from .opd import resolve_distill_step_band
+
+
+@dataclass(kw_only=True)
+class FlowEditConfig(ArgABC):
+    """Configuration for contrastive FlowEdit distillation."""
+
+    server_url_template: str = field(
+        default="http://localhost:809{rank}",
+        metadata={"help": "URL template for FlowEdit servers. {rank} is replaced per DDP rank."},
+    )
+    prompt: str = field(
+        default="Rotate the camera. White background.",
+        metadata={"help": "Text prompt sent to the FlowEdit model."},
+    )
+    cfg_tgt: float = field(
+        default=7.5,
+        metadata={"help": "Classifier-free guidance scale for target (edited) image."},
+    )
+    cfg_src: float = field(
+        default=-7.5,
+        metadata={"help": "Classifier-free guidance scale for source (raw) image."},
+    )
+    n_max: int = field(
+        default=28,
+        metadata={"help": "Maximum number of FlowEdit denoising steps to use."},
+    )
+    steps: int = field(
+        default=28,
+        metadata={"help": "Number of FlowEdit inference steps."},
+    )
+    timeout: float = field(
+        default=120.0,
+        metadata={"help": "HTTP timeout in seconds for a single FlowEdit call."},
+    )
 
 
 @dataclass
@@ -59,10 +94,22 @@ class Trellis2OPDTrainingArguments(TrainingArguments):
             ),
         },
     )
+    flowedit: Optional[FlowEditConfig] = field(
+        default=None,
+        metadata={
+            "help": (
+                "FlowEdit contrastive distillation config. "
+                "None disables (standard self-distill). "
+                "Pass a dict or FlowEditConfig to enable."
+            ),
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
+        if isinstance(self.flowedit, dict):
+            self.flowedit = FlowEditConfig.from_dict(self.flowedit)
 
     def get_num_train_timesteps(self, args: Any) -> int:
         lo, hi = resolve_distill_step_band(self.num_inference_steps, self.timestep_range)

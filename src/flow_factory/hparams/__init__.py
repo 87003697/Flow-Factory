@@ -29,6 +29,7 @@ from .training_args import (
     CRDTrainingArguments,
     DiffusionOPDTrainingArguments,
     Trellis2OPDTrainingArguments,
+    FlowEditConfig,
     TeacherConfig,
     get_training_args_class,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "CRDTrainingArguments",
     "DiffusionOPDTrainingArguments",
     "Trellis2OPDTrainingArguments",
+    "FlowEditConfig",
     "TeacherConfig",
     "get_training_args_class",
     "RewardArguments",

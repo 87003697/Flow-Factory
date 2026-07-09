@@ -32,14 +32,18 @@ Reference:
 """
 from __future__ import annotations
 
+import base64
 import math
 import os
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from io import BytesIO
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
+import requests
 import torch
 import tqdm as tqdm_
+from PIL import Image
 from torchvision.transforms.functional import to_pil_image
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
@@ -99,31 +103,92 @@ def compute_voxel_visibility(
 class TargetImageBuffer:
     """Buffer for target images extracted from rollout videos.
 
-    Decouples frame extraction (during sample()) from encoding (during
-    prepare_feedback()), making it easy to swap in FlowEdit-edited frames later.
+    When flowedit_fn is provided, each raw render frame is also sent through
+    FlowEdit to produce an edited variant. The buffer stores (raw, edited) pairs.
     """
 
-    def __init__(self, seed: int):
+    def __init__(self, seed: int, flowedit_fn: Optional[Callable[[Image.Image, Image.Image], Image.Image]] = None):
         self._seed = seed
-        self._images: List[Optional["Image.Image"]] = []
+        self._flowedit_fn = flowedit_fn
+        self._raw_images: List[Optional[Image.Image]] = []
+        self._pos_images: List[Optional[Image.Image]] = []
 
     def clear(self):
-        self._images.clear()
+        self._raw_images.clear()
+        self._pos_images.clear()
 
     def add_samples(self, samples: List[BaseSample], epoch: int):
         for s in samples:
             if s.video is None:
-                self._images.append(None)
+                self._raw_images.append(None)
+                self._pos_images.append(None)
                 continue
             gen = create_generator(self._seed, epoch, s.unique_id)
             idx = torch.randint(0, s.video.shape[0], (1,), generator=gen).item()
             s.extra_kwargs["c_tgt_frame_idx"] = idx
-            self._images.append(to_pil_image(s.video[idx].clamp(0, 1)))
+            raw_pil = to_pil_image(s.video[idx].clamp(0, 1))
+            self._raw_images.append(raw_pil)
 
-    def get_images(self) -> List[Optional["Image.Image"]]:
-        return self._images
+            if self._flowedit_fn is not None:
+                cond_pil = to_pil_image(s.condition_image.clamp(0, 1)) if s.condition_image is not None else raw_pil
+                try:
+                    edited_pil = self._flowedit_fn(raw_pil, cond_pil)
+                except Exception as e:
+                    logger.warning("FlowEdit call failed (uid=%s): %s; falling back to raw", s.unique_id, e)
+                    edited_pil = raw_pil
+                self._pos_images.append(edited_pil)
+            else:
+                self._pos_images.append(raw_pil)
+
+    def get_raw_images(self) -> List[Optional[Image.Image]]:
+        return self._raw_images
+
+    def get_pos_images(self) -> List[Optional[Image.Image]]:
+        return self._pos_images
 
 
+def _call_flowedit_server(
+    source: Image.Image,
+    condition: Image.Image,
+    *,
+    server: str,
+    prompt: str,
+    cfg_tgt: float,
+    cfg_src: float,
+    n_max: int,
+    steps: int,
+    timeout: float,
+) -> Image.Image:
+    """Call a FlowEdit vllm-omni server to edit source guided by condition."""
+
+    def _img_to_b64(img: Image.Image) -> str:
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    payload = {
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_img_to_b64(source)}"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_img_to_b64(condition)}"}},
+            ],
+        }],
+        "extra_body": {
+            "num_inference_steps": steps,
+            "guidance_scale": 1,
+            "true_cfg_scale": cfg_tgt,
+            "true_cfg_scale_src": cfg_src,
+            "n_max": n_max,
+        },
+    }
+    resp = requests.post(f"{server}/v1/chat/completions", json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    b64_url = data["choices"][0]["message"]["content"][0]["image_url"]["url"]
+    b64_str = b64_url.split(",", 1)[1]
+    return Image.open(BytesIO(base64.b64decode(b64_str))).convert("RGB")
 
 
 
@@ -149,7 +214,26 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
         if self._training_stage == "dense":
             self._inference_stages = ["dense", "shape", "tex"]
 
-        self._tgt_buffer = TargetImageBuffer(self.training_args.seed)
+        # FlowEdit contrastive distillation setup
+        flowedit_fn: Optional[Callable[[Image.Image, Image.Image], Image.Image]] = None
+        self._use_contrastive = self.training_args.flowedit is not None
+        if self._use_contrastive:
+            fe_cfg = self.training_args.flowedit
+            rank = int(os.environ.get("LOCAL_RANK", 0))
+            server_url = fe_cfg.server_url_template.format(rank=rank)
+            flowedit_fn = partial(
+                _call_flowedit_server,
+                server=server_url,
+                prompt=fe_cfg.prompt,
+                cfg_tgt=fe_cfg.cfg_tgt,
+                cfg_src=fe_cfg.cfg_src,
+                n_max=fe_cfg.n_max,
+                steps=fe_cfg.steps,
+                timeout=fe_cfg.timeout,
+            )
+            logger.info("Contrastive FlowEdit enabled: server=%s", server_url)
+
+        self._tgt_buffer = TargetImageBuffer(self.training_args.seed, flowedit_fn=flowedit_fn)
 
         scheduler = self.adapter.scheduler
         self._is_sde = scheduler.dynamics_type != "ODE"
@@ -248,10 +332,14 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
         if not samples:
             logger.warning("All sample windows skipped (OOM), skipping feedback.")
             return
-        self._encode_c_tgt(samples, self._tgt_buffer.get_images())
-        self._tgt_buffer.clear()
+        if self._use_contrastive:
+            self._encode_c_tgt(samples, self._tgt_buffer.get_pos_images(), key="image_cond_tgt")
+            self._encode_c_tgt(samples, self._tgt_buffer.get_raw_images(), key="image_cond_neg")
+        else:
+            self._encode_c_tgt(samples, self._tgt_buffer.get_pos_images(), key="image_cond_tgt")
         self._build_visibility(samples)
         self._log_train_samples(samples)
+        self._tgt_buffer.clear()
 
     # =============================== Optimization ===============================
 
@@ -272,8 +360,13 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
     # =============================== c_tgt encoding ===============================
 
     @torch.no_grad()
-    def _encode_c_tgt(self, samples: List[BaseSample], images: List[Optional["Image.Image"]]) -> None:
-        """Encode pre-extracted target frames as c_tgt conditioning.
+    def _encode_c_tgt(
+        self,
+        samples: List[BaseSample],
+        images: List[Optional[Image.Image]],
+        key: str = "image_cond_tgt",
+    ) -> None:
+        """Encode pre-extracted target frames as conditioning tensor.
 
         Frame extraction is done by TargetImageBuffer during sample(); this
         method only handles the encoding pass (rembg + DINOv2).
@@ -291,7 +384,7 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
 
         for i, sample in enumerate(samples):
             if i < len(cond_512_list):
-                sample.extra_kwargs["image_cond_tgt"] = cond_512_list[i]
+                sample.extra_kwargs[key] = cond_512_list[i]
 
     # =============================== Visibility mask ===============================
 
@@ -350,7 +443,38 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
         if self.training_args.use_visibility_mask:
             for s in samples:
                 self._attach_visibility_heatmap(s)
+        if self._use_contrastive:
+            self._log_flowedit_comparison(samples)
         self.log_data({"train_samples": samples[:2]}, step=self.step)
+
+    def _log_flowedit_comparison(self, samples: List[BaseSample]) -> None:
+        """Log 3-column wandb image panel: condition | raw_render | flowedit_edited."""
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+
+        raw_images = self._tgt_buffer.get_raw_images()
+        pos_images = self._tgt_buffer.get_pos_images()
+        columns = ["condition", "raw_render", "flowedit_edited"]
+        table = wandb.Table(columns=columns)
+
+        for i, s in enumerate(samples[:4]):
+            cond_pil = to_pil_image(s.condition_image.clamp(0, 1)) if s.condition_image is not None else None
+            raw_pil = raw_images[i] if i < len(raw_images) else None
+            pos_pil = pos_images[i] if i < len(pos_images) else None
+            if cond_pil is None or raw_pil is None or pos_pil is None:
+                continue
+            table.add_data(
+                wandb.Image(cond_pil),
+                wandb.Image(raw_pil),
+                wandb.Image(pos_pil),
+            )
+
+        if len(table.data) > 0:
+            self.log_data({"train/flowedit_comparison": table}, step=self.step)
 
     def _attach_visibility_heatmap(self, sample: BaseSample) -> None:
         """Generate binary heatmap showing target-visible voxels across all views.
@@ -399,13 +523,23 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                     ]
                     batch = BaseSample.stack(micro_batch_samples)
 
-                    cond_override = {"image_cond": batch["image_cond_tgt"]}
-
+                    # Positive target: teacher under c_tgt (edited frame if contrastive)
+                    cond_override_pos = {"image_cond": batch["image_cond_tgt"]}
                     mu_teacher_steps = [
-                        self._forward_step(batch, timestep_index, cond_override=cond_override)[0]
+                        self._forward_step(batch, timestep_index, cond_override=cond_override_pos)[0]
                         .detach()
                         for timestep_index in train_timesteps
                     ]
+
+                    # Negative target: teacher under raw render (contrastive only)
+                    mu_neg_steps = None
+                    if self._use_contrastive:
+                        cond_override_neg = {"image_cond": batch["image_cond_neg"]}
+                        mu_neg_steps = [
+                            self._forward_step(batch, timestep_index, cond_override=cond_override_neg)[0]
+                            .detach()
+                            for timestep_index in train_timesteps
+                        ]
 
                     # Reference KL anchor: ref model under c_ref (no cond_override)
                     mu_ref_steps = None
@@ -416,32 +550,35 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                             for timestep_index in train_timesteps
                         ]
 
-                    _store_mu(mu_teacher_steps, mu_ref_steps, micro_batch_samples, batch)
+                    _store_mu(mu_teacher_steps, mu_ref_steps, micro_batch_samples, batch, mu_neg_steps)
         torch.clear_autocast_cache()
 
-    def _store_mu_cache_dense(self, mu_teacher_steps, mu_ref_steps, micro_batch_samples, batch):
-        # Dense: stack T tensors along dim=1 → (B, T, C, D, H, W). Batch dim is aligned,
-        # so each sample's mu is simply mu_T[i].
+    def _store_mu_cache_dense(self, mu_teacher_steps, mu_ref_steps, micro_batch_samples, batch, mu_neg_steps=None):
         mu_T = torch.stack(mu_teacher_steps, dim=1)  # (B, T, C, D, H, W)
-        mu_ref = torch.stack(mu_ref_steps, dim=1) if mu_ref_steps else None  # (B, T, C, D, H, W) or None
+        mu_ref = torch.stack(mu_ref_steps, dim=1) if mu_ref_steps else None
+        mu_neg = torch.stack(mu_neg_steps, dim=1) if mu_neg_steps else None
         for i, sample in enumerate(micro_batch_samples):
-            sample.extra_kwargs["mu_teacher"] = mu_T[i].to(self._mu_store_device).clone()  # (T, C, D, H, W)
+            sample.extra_kwargs["mu_teacher"] = mu_T[i].to(self._mu_store_device).clone()
             if mu_ref is not None:
-                sample.extra_kwargs["mu_ref"] = mu_ref[i].to(self._mu_store_device).clone()  # (T, C, D, H, W)
+                sample.extra_kwargs["mu_ref"] = mu_ref[i].to(self._mu_store_device).clone()
+            if mu_neg is not None:
+                sample.extra_kwargs["mu_neg"] = mu_neg[i].to(self._mu_store_device).clone()
 
-    def _store_mu_cache_sparse(self, mu_teacher_steps, mu_ref_steps, micro_batch_samples, batch):
-        # Sparse: stack T tensors along dim=0 → (T, N_total, C). Each sample has a
-        # different number of voxels (N_b), so we split by counts derived from batch_idx.
+    def _store_mu_cache_sparse(self, mu_teacher_steps, mu_ref_steps, micro_batch_samples, batch, mu_neg_steps=None):
         mu_T = torch.stack(mu_teacher_steps, dim=0)  # (T, N_total, C)
-        mu_ref = torch.stack(mu_ref_steps, dim=0) if mu_ref_steps else None  # (T, N_total, C) or None
-        batch_idx = batch["sparse_coords"][:, 0].long()  # (N_total,)
+        mu_ref = torch.stack(mu_ref_steps, dim=0) if mu_ref_steps else None
+        mu_neg = torch.stack(mu_neg_steps, dim=0) if mu_neg_steps else None
+        batch_idx = batch["sparse_coords"][:, 0].long()
         counts = [(batch_idx == b).sum().item() for b in range(len(micro_batch_samples))]
-        splits_T = mu_T.split(counts, dim=1)  # list of (T, N_b, C)
+        splits_T = mu_T.split(counts, dim=1)
         splits_ref = mu_ref.split(counts, dim=1) if mu_ref is not None else [None] * len(counts)
+        splits_neg = mu_neg.split(counts, dim=1) if mu_neg is not None else [None] * len(counts)
         for i, sample in enumerate(micro_batch_samples):
-            sample.extra_kwargs["mu_teacher"] = splits_T[i].to(self._mu_store_device).clone()  # (T, N_b, C)
+            sample.extra_kwargs["mu_teacher"] = splits_T[i].to(self._mu_store_device).clone()
             if splits_ref[i] is not None:
-                sample.extra_kwargs["mu_ref"] = splits_ref[i].to(self._mu_store_device).clone()  # (T, N_b, C)
+                sample.extra_kwargs["mu_ref"] = splits_ref[i].to(self._mu_store_device).clone()
+            if splits_neg[i] is not None:
+                sample.extra_kwargs["mu_neg"] = splits_neg[i].to(self._mu_store_device).clone()
 
     # =============================== PASS 2: student distillation ===============================
 
@@ -455,20 +592,17 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = math.ceil(len(samples) / per_device_batch_size)
 
-        # Strategy pattern: bind dense/sparse implementations once before the loop.
-        # The core difference is that sparse latents have no aligned batch dimension —
-        # see the "Dense/Sparse helpers" section below for detailed explanation.
         is_sparse = self._training_stage != "dense"
         if is_sparse:
-            _load_mu = self._load_mu_targets_sparse    # → (T, N_total, C), batch_idx
-            _get_mu = self._get_mu_at_step_sparse      # mu_all[idx] → (N_total, C)
-            _compute_mse = self._compute_mse_sparse    # scatter_add_ per sample → (B,)
-            _load_vis = self._load_vis_mask_sparse      # → (N_total,) or None
+            _load_mu = self._load_mu_targets_sparse
+            _get_mu = self._get_mu_at_step_sparse
+            _compute_mse = self._compute_mse_sparse
+            _load_vis = self._load_vis_mask_sparse
         else:
-            _load_mu = self._load_mu_targets_dense     # → (B, T, C, D, H, W), None
-            _get_mu = self._get_mu_at_step_dense       # mu_all[:, idx] → (B, C, D, H, W)
-            _compute_mse = self._compute_mse_dense     # flatten+mean per sample → (B,)
-            _load_vis = self._load_vis_mask_dense       # → (B, 1, 16, 16, 16) or None
+            _load_mu = self._load_mu_targets_dense
+            _get_mu = self._get_mu_at_step_dense
+            _compute_mse = self._compute_mse_dense
+            _load_vis = self._load_vis_mask_dense
 
         for inner_epoch in range(self.training_args.num_inner_epochs):
             perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
@@ -481,10 +615,13 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
             ref_kl_sum = torch.zeros(1, device=device)
             mask_cov_sum = torch.zeros(1, device=device)
             mask_cov_count = torch.zeros(1, device=device)
+            mse_pos_sum = torch.zeros(1, device=device)
+            mse_neg_sum = torch.zeros(1, device=device)
             grad_norm = None
 
             use_ref_kl = self.training_args.ref_kl_beta > 0
             use_vis_mask = self.training_args.use_visibility_mask
+            use_contrastive = self._use_contrastive
 
             with self.autocast():
                 for batch_idx in tqdm(
@@ -500,13 +637,9 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                         for s in shuffled_samples[start : start + per_device_batch_size]
                     ]
 
-                    # 循环体 — 无分支，用函数变量
                     batch = BaseSample.stack(batch_samples)
                     B = len(batch_samples)
-                    # mu_teacher_all: dense=(B,T,C,D,H,W), sparse=(T,N_total,C)
-                    # ctx: dense=None, sparse=batch_idx (N_total,)
-                    mu_teacher_all, mu_ref_all, ctx = _load_mu(batch_samples, device)
-                    # vis_mask: dense=(B,1,16,16,16), sparse=(N_total,), or None
+                    mu_teacher_all, mu_ref_all, mu_neg_all, ctx = _load_mu(batch_samples, device)
                     vis_mask = _load_vis(batch_samples, device) if use_vis_mask else None
 
                     for idx, timestep_index in enumerate(
@@ -519,11 +652,9 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                         )
                     ):
                         with self.accelerator.accumulate(*self.adapter.trainable_components):
-                            # mu_S: dense=(B,C,D,H,W), sparse=(N_total,C)
                             mu_S, std_dev_t, dt = self._forward_step(batch, timestep_index)
-                            # mu_T: same shape as mu_S
                             mu_T = _get_mu(mu_teacher_all, idx)
-                            per_sample_mse = _compute_mse(mu_S, mu_T, ctx, B, vis_mask)  # (B,)
+                            per_sample_mse_pos = _compute_mse(mu_S, mu_T, ctx, B, vis_mask)
 
                             denom = self.adapter.scheduler.get_kl_divergence_denominator(
                                 std_dev_t, dt
@@ -531,13 +662,20 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                             if isinstance(denom, torch.Tensor) and denom.numel() > 1:
                                 denom = denom.reshape(B, -1).mean(dim=1)
 
-                            per_sample_kl = 0.5 * (per_sample_mse / denom)
+                            if use_contrastive:
+                                mu_neg = _get_mu(mu_neg_all, idx)
+                                per_sample_mse_neg = _compute_mse(mu_S, mu_neg, ctx, B, vis_mask)
+                                per_sample_kl = 0.5 * (per_sample_mse_pos - per_sample_mse_neg) / denom
+                            else:
+                                per_sample_mse_neg = torch.zeros_like(per_sample_mse_pos)
+                                per_sample_kl = 0.5 * (per_sample_mse_pos / denom)
+
                             distill_loss = per_sample_kl.mean()
 
                             ref_kl_loss = torch.zeros(1, device=device)
                             if use_ref_kl:
-                                mu_ref = _get_mu(mu_ref_all, idx)  # same shape as mu_S
-                                ref_mse = _compute_mse(mu_S, mu_ref, ctx, B, None)  # (B,)
+                                mu_ref = _get_mu(mu_ref_all, idx)
+                                ref_mse = _compute_mse(mu_S, mu_ref, ctx, B, None)
                                 ref_kl_loss = self.training_args.ref_kl_beta * ref_mse.mean()
 
                             loss = distill_loss + ref_kl_loss
@@ -551,6 +689,9 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                                 if vis_mask is not None:
                                     mask_cov_sum += vis_mask.mean()
                                     mask_cov_count += 1
+                                if use_contrastive:
+                                    mse_pos_sum += per_sample_mse_pos.detach().mean()
+                                    mse_neg_sum += per_sample_mse_neg.detach().mean()
 
                             if self.accelerator.sync_gradients:
                                 grad_norm = self.accelerator.clip_grad_norm_(
@@ -562,6 +703,7 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                                 self._log_distill_metrics(
                                     kl_sum, kl_count, grad_norm, ref_kl_sum,
                                     mask_cov_sum, mask_cov_count,
+                                    mse_pos_sum, mse_neg_sum,
                                 )
                                 self.step += 1
                                 kl_sum.zero_()
@@ -569,6 +711,8 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                                 ref_kl_sum.zero_()
                                 mask_cov_sum.zero_()
                                 mask_cov_count.zero_()
+                                mse_pos_sum.zero_()
+                                mse_neg_sum.zero_()
 
     # =============================== Dense/Sparse helpers ===============================
     #
@@ -602,21 +746,27 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
 
     def _load_mu_targets_dense(self, batch_samples, device):
         """Dense: stack → (B, T, C, D, H, W). ctx=None (batch dim handles separation)."""
-        mu_T = torch.stack([s.extra_kwargs["mu_teacher"].to(device) for s in batch_samples])  # (B, T, C, D, H, W)
+        mu_T = torch.stack([s.extra_kwargs["mu_teacher"].to(device) for s in batch_samples])
         mu_ref = None
         if self.training_args.ref_kl_beta > 0:
-            mu_ref = torch.stack([s.extra_kwargs["mu_ref"].to(device) for s in batch_samples])  # (B, T, C, D, H, W)
-        return mu_T, mu_ref, None  # ctx=None for dense
+            mu_ref = torch.stack([s.extra_kwargs["mu_ref"].to(device) for s in batch_samples])
+        mu_neg = None
+        if self._use_contrastive:
+            mu_neg = torch.stack([s.extra_kwargs["mu_neg"].to(device) for s in batch_samples])
+        return mu_T, mu_ref, mu_neg, None  # ctx=None for dense
 
     def _load_mu_targets_sparse(self, batch_samples, device):
         """Sparse: cat → (T, N_total, C). ctx=batch_idx to map voxels back to samples."""
-        mu_T = torch.cat([s.extra_kwargs["mu_teacher"].to(device) for s in batch_samples], dim=1)  # (T, N_total, C)
+        mu_T = torch.cat([s.extra_kwargs["mu_teacher"].to(device) for s in batch_samples], dim=1)
         mu_ref = None
         if self.training_args.ref_kl_beta > 0:
-            mu_ref = torch.cat([s.extra_kwargs["mu_ref"].to(device) for s in batch_samples], dim=1)  # (T, N_total, C)
+            mu_ref = torch.cat([s.extra_kwargs["mu_ref"].to(device) for s in batch_samples], dim=1)
+        mu_neg = None
+        if self._use_contrastive:
+            mu_neg = torch.cat([s.extra_kwargs["mu_neg"].to(device) for s in batch_samples], dim=1)
         batch = BaseSample.stack(batch_samples)
-        batch_idx = batch["sparse_coords"][:, 0].long()  # (N_total,) — sample index per voxel
-        return mu_T, mu_ref, batch_idx
+        batch_idx = batch["sparse_coords"][:, 0].long()
+        return mu_T, mu_ref, mu_neg, batch_idx
 
     def _get_mu_at_step_dense(self, mu_all, idx):
         # mu_all: (B, T, C, D, H, W) → index timestep dim
@@ -737,6 +887,8 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
         ref_kl_sum: Optional[torch.Tensor] = None,
         mask_cov_sum: Optional[torch.Tensor] = None,
         mask_cov_count: Optional[torch.Tensor] = None,
+        mse_pos_sum: Optional[torch.Tensor] = None,
+        mse_neg_sum: Optional[torch.Tensor] = None,
     ) -> None:
         packed = torch.stack([kl_sum.squeeze(), kl_count.squeeze()])
         packed = cast(torch.Tensor, self.accelerator.reduce(packed, reduction="sum"))
@@ -751,5 +903,9 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
             metrics["ref_kl"] = ref_kl_sum.squeeze()
         if mask_cov_count is not None and mask_cov_count.item() > 0:
             metrics["mask_coverage"] = (mask_cov_sum / mask_cov_count).squeeze()
+        if mse_pos_sum is not None and mse_pos_sum.item() > 0:
+            metrics["mse_pos"] = mse_pos_sum.squeeze()
+        if mse_neg_sum is not None and mse_neg_sum.item() > 0:
+            metrics["mse_neg"] = mse_neg_sum.squeeze()
 
         self.log_data({f"train/{k}": v for k, v in metrics.items()}, step=self.step)

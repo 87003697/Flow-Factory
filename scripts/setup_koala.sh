@@ -377,6 +377,18 @@ mkdir -p "${PROJECT_DIR}/dataset"
 # dataset/trellis2/ → 直接 symlink 到解压目录（已含 train.jsonl + images/）
 ln -sfn "${DATASET_LOCAL}" "${PROJECT_DIR}/dataset/trellis2"
 
+# Qwen-Image-Edit (FlowEdit contrastive distillation, optional)
+QWEN_LOCAL="/local-ssd/qwen-image-edit-2511"
+if [ -d "${QWEN_LOCAL}" ]; then
+    echo "  Qwen-Image-Edit: present"
+elif s5cmd ls "${QWEN_TAR}" &>/dev/null; then
+    echo "  Qwen-Image-Edit: restoring (~39 GB)..."
+    s5cmd cat "${QWEN_TAR}" | tar xf - -C /local-ssd/
+    echo "  Qwen-Image-Edit: done"
+else
+    echo "  Qwen-Image-Edit: tar not found, skipping (non-contrastive mode)"
+fi
+
 # ============================================================================
 # [7/7] 后台 S3 sync（训练产出持久化）
 # ============================================================================
