@@ -29,9 +29,12 @@ for rank in $(seq 0 $((NUM_GPUS - 1))); do
     port=$((BASE_PORT + rank))
     log="/tmp/flowedit_server_${rank}.log"
 
-    CUDA_VISIBLE_DEVICES=$rank python -m vllm.entrypoints.openai.api_server \
-        --model "$MODEL_PATH" \
+    CUDA_VISIBLE_DEVICES=$rank /tmp/vllm-venv/bin/python \
+        -m vllm_omni.entrypoints.cli.main serve \
+        "$MODEL_PATH" \
+        --omni \
         --port "$port" \
+        --host 0.0.0.0 \
         --gpu-memory-utilization "$GPU_MEM_UTIL" \
         --max-model-len 8192 \
         --trust-remote-code \

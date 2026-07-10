@@ -111,17 +111,17 @@ class TargetImageBuffer:
         self._seed = seed
         self._flowedit_fn = flowedit_fn
         self._raw_images: List[Optional[Image.Image]] = []
-        self._pos_images: List[Optional[Image.Image]] = []
+        self._edited_images: List[Optional[Image.Image]] = []
 
     def clear(self):
         self._raw_images.clear()
-        self._pos_images.clear()
+        self._edited_images.clear()
 
     def add_samples(self, samples: List[BaseSample], epoch: int):
         for s in samples:
             if s.video is None:
                 self._raw_images.append(None)
-                self._pos_images.append(None)
+                self._edited_images.append(None)
                 continue
             gen = create_generator(self._seed, epoch, s.unique_id)
             idx = torch.randint(0, s.video.shape[0], (1,), generator=gen).item()
@@ -130,21 +130,25 @@ class TargetImageBuffer:
             self._raw_images.append(raw_pil)
 
             if self._flowedit_fn is not None:
-                cond_pil = to_pil_image(s.condition_image.clamp(0, 1)) if s.condition_image is not None else raw_pil
+                if s.condition_images:
+                    ci = s.condition_images[0]
+                    cond_pil = ci if isinstance(ci, Image.Image) else to_pil_image(ci.clamp(0, 1))
+                else:
+                    cond_pil = raw_pil
                 try:
                     edited_pil = self._flowedit_fn(raw_pil, cond_pil)
                 except Exception as e:
                     logger.warning("FlowEdit call failed (uid=%s): %s; falling back to raw", s.unique_id, e)
                     edited_pil = raw_pil
-                self._pos_images.append(edited_pil)
+                self._edited_images.append(edited_pil)
             else:
-                self._pos_images.append(raw_pil)
+                self._edited_images.append(raw_pil)
 
     def get_raw_images(self) -> List[Optional[Image.Image]]:
         return self._raw_images
 
-    def get_pos_images(self) -> List[Optional[Image.Image]]:
-        return self._pos_images
+    def get_edited_images(self) -> List[Optional[Image.Image]]:
+        return self._edited_images
 
 
 def _call_flowedit_server(
@@ -333,10 +337,10 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
             logger.warning("All sample windows skipped (OOM), skipping feedback.")
             return
         if self._use_contrastive:
-            self._encode_c_tgt(samples, self._tgt_buffer.get_pos_images(), key="image_cond_tgt")
+            self._encode_c_tgt(samples, self._tgt_buffer.get_edited_images(), key="image_cond_tgt")
             self._encode_c_tgt(samples, self._tgt_buffer.get_raw_images(), key="image_cond_neg")
         else:
-            self._encode_c_tgt(samples, self._tgt_buffer.get_pos_images(), key="image_cond_tgt")
+            self._encode_c_tgt(samples, self._tgt_buffer.get_edited_images(), key="image_cond_tgt")
         self._build_visibility(samples)
         self._log_train_samples(samples)
         self._tgt_buffer.clear()
@@ -448,7 +452,7 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
         self.log_data({"train_samples": samples[:2]}, step=self.step)
 
     def _log_flowedit_comparison(self, samples: List[BaseSample]) -> None:
-        """Log 3-column wandb image panel: condition | raw_render | flowedit_edited."""
+        """Log side-by-side wandb images: condition | raw_render (neg) | flowedit (edited)."""
         try:
             import wandb
         except ImportError:
@@ -457,24 +461,32 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
             return
 
         raw_images = self._tgt_buffer.get_raw_images()
-        pos_images = self._tgt_buffer.get_pos_images()
-        columns = ["condition", "raw_render", "flowedit_edited"]
-        table = wandb.Table(columns=columns)
+        edited_images = self._tgt_buffer.get_edited_images()
+        log_dict = {}
 
         for i, s in enumerate(samples[:4]):
-            cond_pil = to_pil_image(s.condition_image.clamp(0, 1)) if s.condition_image is not None else None
+            if s.condition_images:
+                ci = s.condition_images[0]
+                cond_pil = ci if isinstance(ci, Image.Image) else to_pil_image(ci.clamp(0, 1))
+            else:
+                cond_pil = None
             raw_pil = raw_images[i] if i < len(raw_images) else None
-            pos_pil = pos_images[i] if i < len(pos_images) else None
-            if cond_pil is None or raw_pil is None or pos_pil is None:
+            edited_pil = edited_images[i] if i < len(edited_images) else None
+            if cond_pil is None or raw_pil is None or edited_pil is None:
                 continue
-            table.add_data(
-                wandb.Image(cond_pil),
-                wandb.Image(raw_pil),
-                wandb.Image(pos_pil),
+            w, h = cond_pil.size
+            raw_pil = raw_pil.resize((w, h), Image.Resampling.LANCZOS)
+            edited_pil = edited_pil.resize((w, h), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGB", (w * 3, h))
+            canvas.paste(cond_pil.convert("RGB"), (0, 0))
+            canvas.paste(raw_pil.convert("RGB"), (w, 0))
+            canvas.paste(edited_pil.convert("RGB"), (w * 2, 0))
+            log_dict[f"flowedit_comparison/{i}"] = wandb.Image(
+                canvas, caption="condition | raw_render (neg) | flowedit (pos)"
             )
 
-        if len(table.data) > 0:
-            self.log_data({"train/flowedit_comparison": table}, step=self.step)
+        if log_dict:
+            self.log_data(log_dict, step=self.step)
 
     def _attach_visibility_heatmap(self, sample: BaseSample) -> None:
         """Generate binary heatmap showing target-visible voxels across all views.

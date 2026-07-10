@@ -370,7 +370,7 @@ if [ -d "${DATASET_LOCAL}/images" ]; then
     echo "  Dataset: present"
 elif s5cmd ls "${DATASET_TAR}" &>/dev/null; then
     echo "  Dataset: restoring..."
-    s5cmd cat "${DATASET_TAR}" | tar xf - -C /local-ssd/
+    s5cmd cat "${DATASET_TAR}" | tar --warning=no-unknown-keyword -xf - -C /local-ssd/
     echo "  Dataset: done"
 fi
 mkdir -p "${PROJECT_DIR}/dataset"
@@ -378,13 +378,41 @@ mkdir -p "${PROJECT_DIR}/dataset"
 ln -sfn "${DATASET_LOCAL}" "${PROJECT_DIR}/dataset/trellis2"
 
 # Qwen-Image-Edit (FlowEdit contrastive distillation, optional)
+# The S3 tar contains HF cache blobs (no snapshots/ directory — symlinks lost during Mac tar).
+# Strategy: extract blobs from tar, then use snapshot_download() to reconstruct the
+# snapshots/ symlink directory (API call for manifest, zero actual downloading since blobs exist).
 QWEN_LOCAL="/local-ssd/qwen-image-edit-2511"
 if [ -d "${QWEN_LOCAL}" ]; then
     echo "  Qwen-Image-Edit: present"
 elif s5cmd ls "${QWEN_TAR}" &>/dev/null; then
-    echo "  Qwen-Image-Edit: restoring (~39 GB)..."
-    s5cmd cat "${QWEN_TAR}" | tar xf - -C /local-ssd/
-    echo "  Qwen-Image-Edit: done"
+    echo "  Qwen-Image-Edit: downloading tar (~41 GB via aws s3 cp)..."
+    QWEN_TAR_LOCAL="/local-ssd/qwen-image-edit-2511.tar"
+    aws s3 cp "${QWEN_TAR}" "${QWEN_TAR_LOCAL}" --only-show-errors
+    echo "  Qwen-Image-Edit: extracting (tar size: $(du -h ${QWEN_TAR_LOCAL} | cut -f1))..."
+    tar --warning=no-unknown-keyword -xf "${QWEN_TAR_LOCAL}" -C /local-ssd/ || true
+    rm -f "${QWEN_TAR_LOCAL}"
+    echo "  Qwen-Image-Edit: reconstructing snapshot from cached blobs..."
+    # snapshot_download hits HF API for file manifest (~1s), finds all blobs already
+    # in cache, creates snapshots/<hash>/ with symlinks → blobs. Near-instant.
+    QWEN_SNAPSHOT=$(HF_HOME=/local-ssd/hf_cache HF_HUB_DISABLE_XET=1 \
+        /tmp/uv-venv/bin/python -c "
+from huggingface_hub import snapshot_download
+path = snapshot_download('Qwen/Qwen-Image-Edit-2511')
+print(path)
+" 2>&1) || true
+    # Extract the last line (the path); earlier lines may be progress/warnings
+    QWEN_PATH=$(echo "$QWEN_SNAPSHOT" | tail -1)
+    if [ -n "$QWEN_PATH" ] && [ -f "${QWEN_PATH}/model_index.json" ]; then
+        ln -sfn "$QWEN_PATH" "${QWEN_LOCAL}"
+        echo "  Qwen-Image-Edit: done (→ $QWEN_PATH)"
+    else
+        echo "  ERROR: snapshot_download failed to reconstruct model"
+        echo "  Output: $QWEN_SNAPSHOT"
+        echo "  Path checked: $QWEN_PATH"
+        echo "  Cache contents:"
+        find /local-ssd/hf_cache/ -maxdepth 3 -type d 2>/dev/null || true
+        exit 1
+    fi
 else
     echo "  Qwen-Image-Edit: tar not found, skipping (non-contrastive mode)"
 fi
