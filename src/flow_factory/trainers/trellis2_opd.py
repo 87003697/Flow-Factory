@@ -399,6 +399,7 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
             frame_idx = sample.extra_kwargs.get("c_tgt_frame_idx")  # int
             masks = sample.extra_kwargs.get("visibility_masks")  # (num_frames, 16, 16, 16)
             if frame_idx is None or masks is None:
+                sample.extra_kwargs["visibility_mask"] = None
                 continue
             # Select the frame's visibility grid and add channel dim
             sample.extra_kwargs["visibility_mask"] = masks[frame_idx].unsqueeze(0).to(
@@ -412,6 +413,7 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
             frame_idx = sample.extra_kwargs.get("c_tgt_frame_idx")  # int
             masks = sample.extra_kwargs.get("visibility_masks")  # (num_frames, ss_res, ss_res, ss_res)
             if frame_idx is None or masks is None:
+                sample.extra_kwargs["visibility_mask"] = None
                 continue
             frame_mask = masks[frame_idx]  # (ss_res, ss_res, ss_res)
             ss_res = frame_mask.shape[0]

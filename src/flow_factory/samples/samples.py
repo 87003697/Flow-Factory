@@ -398,6 +398,10 @@ class BaseSample:
         if all(v is None for v in values):
             return None
 
+        # Any None mixed with non-None - cannot stack, return as list
+        if any(v is None for v in values):
+            return values
+
         first = values[0]
 
         # 1. Shared fields - take first element only
