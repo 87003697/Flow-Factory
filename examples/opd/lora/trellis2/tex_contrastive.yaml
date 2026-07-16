@@ -98,6 +98,8 @@ train:
     n_max: 21
     steps: 28
     timeout: 120.0
+    noise_mode: "aligned"
+    seed: 42
 
 scheduler:
   dynamics_type: "Flow-SDE"

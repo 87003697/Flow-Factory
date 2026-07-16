@@ -162,6 +162,8 @@ def _call_flowedit_server(
     n_max: int,
     steps: int,
     timeout: float,
+    noise_mode: str = "aligned",
+    seed: Optional[int] = None,
 ) -> Image.Image:
     """Call a FlowEdit vllm-omni server to edit source guided by condition."""
 
@@ -169,6 +171,17 @@ def _call_flowedit_server(
         buf = BytesIO()
         img.save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode()
+
+    extra_body: Dict[str, Any] = {
+        "num_inference_steps": steps,
+        "guidance_scale": 1,
+        "true_cfg_scale": cfg_tgt,
+        "true_cfg_scale_src": cfg_src,
+        "n_max": n_max,
+        "noise_mode": noise_mode,
+    }
+    if seed is not None:
+        extra_body["seed"] = seed
 
     payload = {
         "messages": [{
@@ -179,13 +192,7 @@ def _call_flowedit_server(
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_img_to_b64(condition)}"}},
             ],
         }],
-        "extra_body": {
-            "num_inference_steps": steps,
-            "guidance_scale": 1,
-            "true_cfg_scale": cfg_tgt,
-            "true_cfg_scale_src": cfg_src,
-            "n_max": n_max,
-        },
+        "extra_body": extra_body,
     }
     resp = requests.post(f"{server}/v1/chat/completions", json=payload, timeout=timeout)
     resp.raise_for_status()
@@ -234,8 +241,13 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                 n_max=fe_cfg.n_max,
                 steps=fe_cfg.steps,
                 timeout=fe_cfg.timeout,
+                noise_mode=fe_cfg.noise_mode,
+                seed=fe_cfg.seed,
             )
-            logger.info("Contrastive FlowEdit enabled: server=%s", server_url)
+            logger.info(
+                "Contrastive FlowEdit enabled: server=%s, noise_mode=%s, seed=%s",
+                server_url, fe_cfg.noise_mode, fe_cfg.seed,
+            )
 
         self._tgt_buffer = TargetImageBuffer(self.training_args.seed, flowedit_fn=flowedit_fn)
 

@@ -40,6 +40,26 @@ class FlowEditConfig(ArgABC):
         default=120.0,
         metadata={"help": "HTTP timeout in seconds for a single FlowEdit call."},
     )
+    noise_mode: Literal["fixed", "random", "aligned"] = field(
+        default="aligned",
+        metadata={
+            "help": (
+                "noise_mode for FlowEdit denoising. "
+                "'aligned' follows tgt CFG drift (recommended); "
+                "'fixed' uses one seeded noise for src+tgt; "
+                "'random' draws fresh noise per branch."
+            ),
+        },
+    )
+    seed: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Seed for FlowEdit noise sampling. "
+                "None omits the field from payload (server picks its default)."
+            ),
+        },
+    )
 
 
 @dataclass

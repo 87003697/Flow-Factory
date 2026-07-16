@@ -34,11 +34,14 @@ def parse_args():
     parser.add_argument("--weights", type=str, default="/local-ssd/pretrained_weights")
     parser.add_argument("--num-samples", type=int, default=20)
     parser.add_argument("--prompt", type=str, default="Rotate the camera. White background.")
-    parser.add_argument("--cfg-tgt", type=float, default=7.5)
-    parser.add_argument("--cfg-src", type=float, default=-7.5)
-    parser.add_argument("--n-max", type=int, default=28)
+    parser.add_argument("--cfg-tgt", type=float, default=4.0)
+    parser.add_argument("--cfg-src", type=float, default=0.0)
+    parser.add_argument("--n-max", type=int, default=21)
     parser.add_argument("--steps", type=int, default=28)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--noise-mode", type=str, default="aligned",
+                        choices=["fixed", "random", "aligned"],
+                        help="noise_mode for FlowEdit denoising (matches training config).")
     parser.add_argument("--render-views", type=int, default=16,
                         help="Number of rendered views per sample (pick random frame)")
     return parser.parse_args()
@@ -56,7 +59,8 @@ def img_to_b64(img: Image.Image) -> str:
 
 def call_flowedit(server: str, source: Image.Image, condition: Image.Image,
                   prompt: str, cfg_tgt: float, cfg_src: float,
-                  n_max: int, steps: int, seed: int) -> Image.Image:
+                  n_max: int, steps: int, seed: int,
+                  noise_mode: str = "aligned") -> Image.Image:
     payload = {
         "messages": [{
             "role": "user",
@@ -73,6 +77,7 @@ def call_flowedit(server: str, source: Image.Image, condition: Image.Image,
             "true_cfg_scale_src": cfg_src,
             "n_max": n_max,
             "seed": seed,
+            "noise_mode": noise_mode,
         }
     }
     resp = requests.post(f"{server}/v1/chat/completions", json=payload, timeout=120)
@@ -198,6 +203,7 @@ def main():
                 args.server, raw, cond,
                 args.prompt, args.cfg_tgt, args.cfg_src,
                 args.n_max, args.steps, args.seed + i,
+                noise_mode=args.noise_mode,
             )
         except Exception as e:
             print(f"  FlowEdit failed for {uid}: {e}")
