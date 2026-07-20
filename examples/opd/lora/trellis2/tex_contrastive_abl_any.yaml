@@ -1,4 +1,5 @@
 # Trellis2 OPD contrastive distillation: tex stage (sparse latent).
+# Ablation variant — visibility_mask_mode = any (binary OR: pixel visible in ≥1 frame).
 # Teacher = pretrained base; Student = base + LoRA.
 # Positive target: teacher conditioned on FlowEdit-edited render frame.
 # Negative target: teacher conditioned on raw render frame.
@@ -49,7 +50,7 @@ model:
     dynamics_type: "ODE"
 
 log:
-  run_name: null
+  run_name: "contrastive-abl-vis-any"
   project: "Flow-Factory"
   logging_backend: "wandb"
   save_dir: "saves/"
@@ -88,7 +89,7 @@ train:
   teacher_frame_strategy: "random"
   ref_kl_beta: 1.0
   use_visibility_mask: true
-  visibility_mask_mode: "soft"
+  visibility_mask_mode: "any"
 
   flowedit:
     server_url_template: "http://localhost:809{rank}"
@@ -126,21 +127,21 @@ rewards:
     num_workers: 1
 
 eval_rewards:
-  - name: "pickscore"                       # text ↔ frame (原 baseline 对照信号)
+  - name: "pickscore"
     reward_model: "PickScore"
     batch_size: 8
     device: "cuda"
     dtype: bfloat16
     async_reward: true
     num_workers: 1
-  - name: "pickscore_condimg"               # text+condition_image ↔ frame (对 texture 一致性最敏感)
+  - name: "pickscore_condimg"
     reward_model: "pickscore_text_image_sum"
     batch_size: 8
     device: "cuda"
     dtype: bfloat16
     async_reward: true
     num_workers: 1
-  - name: "clip_text"                       # 原生 CLIP text↔image (无 Pick-a-Pic bias 的 sanity check)
+  - name: "clip_text"
     reward_model: "CLIP"
     batch_size: 8
     device: "cuda"

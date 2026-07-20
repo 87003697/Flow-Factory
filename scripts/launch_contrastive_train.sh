@@ -3,11 +3,15 @@
 # Orchestrates: setup → vllm-venv restore → FlowEdit servers → training.
 #
 # Usage (in koala submit -c):
-#   cd /data/work/run_codes && bash scripts/launch_contrastive_train.sh [YAML_OVERRIDE...]
+#   cd /data/work/run_codes && [TRAIN_YAML=<path>] bash scripts/launch_contrastive_train.sh
+#
+# TRAIN_YAML env var overrides the default YAML (tex_contrastive.yaml).
+# Note: `train.max_epochs=X` style CLI overrides are NOT supported — the
+# training entrypoint (`ff-train`) discards unknown args. Use a distinct YAML.
 #
 # Example:
 #   koala submit -m normal -g 8 --s3-log --code "$S3:/data/work/run_codes" \
-#       -c "cd /data/work/run_codes && bash scripts/launch_contrastive_train.sh train.max_epochs=5"
+#       -c "cd /data/work/run_codes && TRAIN_YAML=examples/opd/lora/trellis2/tex_contrastive_abl_any.yaml bash scripts/launch_contrastive_train.sh"
 set -euo pipefail
 
 PROJECT_DIR="/data/work/run_codes"
@@ -54,14 +58,15 @@ bash scripts/start_flowedit_servers.sh
 # ============================================================================
 echo ""
 echo "=== Phase 4: Training ==="
-YAML="examples/opd/lora/trellis2/tex_contrastive.yaml"
+YAML="${TRAIN_YAML:-examples/opd/lora/trellis2/tex_contrastive.yaml}"
 
-# Pass any extra args from command line (e.g. train.max_epochs=5)
-EXTRA_ARGS="$*"
+if [ ! -f "${YAML}" ]; then
+    echo "ERROR: YAML not found: ${YAML}"
+    exit 1
+fi
 
 echo "Config: ${YAML}"
-echo "Extra:  ${EXTRA_ARGS:-none}"
 echo ""
 
 # ff-train is the CLI entry point (installed in /tmp/uv-venv/bin by uv sync)
-exec ff-train "${YAML}" ${EXTRA_ARGS}
+exec ff-train "${YAML}"
