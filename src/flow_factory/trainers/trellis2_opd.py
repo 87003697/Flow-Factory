@@ -691,6 +691,12 @@ class Trellis2OPDTrainer(Trellis2TrainerMixin, BaseTrainer):
                             if use_contrastive:
                                 mu_neg = _get_mu(mu_neg_all, idx)
                                 per_sample_mse_neg = _compute_mse(mu_S, mu_neg, ctx, B, vis_mask)
+                                # CAVEAT: ∇_{mu_S} of (mse_pos - mse_neg) = (mu_neg - mu_T),
+                                # a constant direction independent of mu_S. The 4-mode vis-mask
+                                # ablation (2026-07-20) confirmed eval is flat over 6k steps
+                                # (pickscore 0.7195 vs baseline 0.7240). Fix requires a loss
+                                # whose gradient depends on the student position (triplet-margin
+                                # or InfoNCE) — see .agents/sessions/2026-07-20-vis-mask-ablation-flat.md.
                                 per_sample_kl = 0.5 * (per_sample_mse_pos - per_sample_mse_neg) / denom
                             else:
                                 per_sample_mse_neg = torch.zeros_like(per_sample_mse_pos)
