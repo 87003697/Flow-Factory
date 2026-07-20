@@ -35,6 +35,7 @@ for rank in $(seq 0 $((NUM_GPUS - 1))); do
         --omni \
         --port "$port" \
         --host 0.0.0.0 \
+        --model-class-name QwenImageFlowEditPipeline \
         --gpu-memory-utilization "$GPU_MEM_UTIL" \
         --max-model-len 8192 \
         --trust-remote-code \
